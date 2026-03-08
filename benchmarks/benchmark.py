@@ -1,8 +1,8 @@
-"""Benchmark diff_attn_with_noisy_input vs flash_attn causal."""
+"""Benchmark diff_attn_varlen_with_noisy_input vs flash_attn causal."""
 import torch
 import math
 import gc
-from fast_diffusion_attention import diff_attn_with_noisy_input
+from fast_diffusion_attention import diff_attn_varlen_with_noisy_input
 from flash_attn import flash_attn_varlen_func
 
 
@@ -48,7 +48,7 @@ def run_benchmark(mode="fwd"):
     title = "FORWARD" if mode == "fwd" else "FWD+BWD"
 
     print(f"\n{'=' * 95}")
-    print(f"{title} BENCHMARK: diff_attn_with_noisy_input vs flash_attn_varlen_func (causal)")
+    print(f"{title} BENCHMARK: diff_attn_varlen_with_noisy_input vs flash_attn_varlen_func (causal)")
     print(f"n_heads={n_heads}, head_dim={head_dim}")
     print(f"{'=' * 95}")
     print(f"{'seqlen':>8} {'staircase':>10} {'L0':>6} {'L1':>6} | {'ours(ms)':>10} {'flash(ms)':>10} | "
@@ -68,14 +68,14 @@ def run_benchmark(mode="fwd"):
 
         if mode == "fwd":
             def run_ours(q=qd, k=kd, v=vd, c=cu, a=l0a, b=l1a, s=ss, m=at):
-                return diff_attn_with_noisy_input(q, k, v, c, a, b, s, max_seqlen=m)
+                return diff_attn_varlen_with_noisy_input(q, k, v, c, a, b, s, max_seqlen=m)
             def run_flash(q=qd, k=kd, v=vd, c=cu, t=at):
                 return flash_attn_varlen_func(q, k, v, c, c, t, t, causal=True)
             mult = 1.0
         else:
             def run_ours(q=qd, k=kd, v=vd, c=cu, a=l0a, b=l1a, s=ss, m=at):
                 qq, kk, vv = q.detach().requires_grad_(True), k.detach().requires_grad_(True), v.detach().requires_grad_(True)
-                diff_attn_with_noisy_input(qq, kk, vv, c, a, b, s, max_seqlen=m).sum().backward()
+                diff_attn_varlen_with_noisy_input(qq, kk, vv, c, a, b, s, max_seqlen=m).sum().backward()
             def run_flash(q=qd, k=kd, v=vd, c=cu, t=at):
                 qq, kk, vv = q.detach().requires_grad_(True), k.detach().requires_grad_(True), v.detach().requires_grad_(True)
                 flash_attn_varlen_func(qq, kk, vv, c, c, t, t, causal=True).sum().backward()

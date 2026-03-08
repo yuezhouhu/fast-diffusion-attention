@@ -22,7 +22,7 @@ Requirements: PyTorch >= 2.0, Triton >= 3.0, NVIDIA GPU (Ampere or newer).
 
 ```python
 import torch
-from fast_diffusion_attention import diff_attn_with_noisy_input
+from fast_diffusion_attention import diff_attn_varlen_with_noisy_input
 
 # Single document: prompt=128, response=64, staircase_size=4
 L0, L1, S = 128, 64, 4
@@ -37,7 +37,7 @@ cu_seqlens = torch.tensor([0, total], dtype=torch.int32, device="cuda")
 L0_arr = torch.tensor([L0], dtype=torch.int32, device="cuda")
 L1_arr = torch.tensor([L1], dtype=torch.int32, device="cuda")
 
-out = diff_attn_with_noisy_input(
+out = diff_attn_varlen_with_noisy_input(
     q, k, v, cu_seqlens, L0_arr, L1_arr,
     staircase_size=S,
     max_seqlen=total,
@@ -47,12 +47,12 @@ out = diff_attn_with_noisy_input(
 
 ## API Reference
 
-### `diff_attn_with_noisy_input`
+### `diff_attn_varlen_with_noisy_input`
 
 ```python
-from fast_diffusion_attention import diff_attn_with_noisy_input
+from fast_diffusion_attention import diff_attn_varlen_with_noisy_input
 
-out = diff_attn_with_noisy_input(
+out = diff_attn_varlen_with_noisy_input(
     q, k, v,
     cu_seqlens,
     L0_arr, L1_arr,
@@ -83,43 +83,6 @@ Fused multi-head attention with the diffusion noisy-input staircase mask. Suppor
 | Type | Description |
 |------|-------------|
 | `Tensor [T, H, D]` | Output tensor, same shape and dtype as `q`. |
-
----
-
-### `diff_attn_varlen_v2`
-
-```python
-from fast_diffusion_attention import diff_attn_varlen_v2
-
-out = diff_attn_varlen_v2(
-    q, k, v,
-    cu_seqlens_q, cu_seqlens_k,
-    staircase_size=4,
-)
-```
-
-Staircase (block semi-autoregressive) attention — **forward only**. Supports grouped-query attention (GQA). Suitable for inference prefill.
-
-#### Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `q` | `Tensor [T, H, D]` | Query tensor. `float16` or `bfloat16`. |
-| `k` | `Tensor [T, Hkv, D]` | Key tensor. `H` must be divisible by `Hkv` (GQA). |
-| `v` | `Tensor [T, Hkv, D]` | Value tensor. Same shape as `k`. |
-| `cu_seqlens_q` | `Tensor [B+1]` | Cumulative query sequence lengths, `int32`. |
-| `cu_seqlens_k` | `Tensor [B+1]` | Cumulative key sequence lengths, `int32`. |
-| `staircase_size` | `int` | Block size. Power of 2 in `{1, 2, 4, 8, 16, 32, 64}`. |
-
-#### Returns
-
-| Type | Description |
-|------|-------------|
-| `Tensor [T, H, D]` | Output tensor, same shape and dtype as `q`. |
-
-> **Note:** This function does not support backward. For training, use `diff_attn_with_noisy_input`.
-
----
 
 ## Attention Mask Structure
 
@@ -176,7 +139,7 @@ cu_seqlens = torch.tensor([0, 256, 384, 576], dtype=torch.int32, device="cuda")
 L0_arr = torch.tensor(L0_list, dtype=torch.int32, device="cuda")
 L1_arr = torch.tensor(L1_list, dtype=torch.int32, device="cuda")
 
-out = diff_attn_with_noisy_input(
+out = diff_attn_varlen_with_noisy_input(
     q, k, v, cu_seqlens, L0_arr, L1_arr,
     staircase_size=4,
     max_seqlen=max(doc_lens),
@@ -189,7 +152,7 @@ Cross-document attention is **never** computed — each document is fully indepe
 
 ```python
 import torch
-from fast_diffusion_attention import diff_attn_with_noisy_input
+from fast_diffusion_attention import diff_attn_varlen_with_noisy_input
 
 L0, L1, S = 512, 256, 8
 total = L0 + 2 * L1
@@ -204,7 +167,7 @@ l0 = torch.tensor([L0], dtype=torch.int32, device="cuda")
 l1 = torch.tensor([L1], dtype=torch.int32, device="cuda")
 
 # Forward
-out = diff_attn_with_noisy_input(q, k, v, cu, l0, l1, staircase_size=S, max_seqlen=total)
+out = diff_attn_varlen_with_noisy_input(q, k, v, cu, l0, l1, staircase_size=S, max_seqlen=total)
 
 # Backward
 loss = out.sum()

@@ -1,4 +1,4 @@
-"""Reference mask generator for diff_attn_with_noisy_input — verify against example.txt."""
+"""Reference mask generator for diff_attn_varlen_with_noisy_input — verify against example.txt."""
 import torch
 
 def build_mask_for_doc(L0, L1, staircase_size):

@@ -6,17 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Pip-installable Python package (`fast_diffusion_attention`) providing GPU-accelerated attention kernels for diffusion LM training, implemented with Triton.
 
-Two public functions:
-1. `diff_attn_with_noisy_input` — forward+backward, full prompt/clean/noisy staircase mask, GQA support
-2. `diff_attn_varlen_v2` — forward-only staircase attention with GQA support
+One public function: `diff_attn_varlen_with_noisy_input` — forward+backward, full prompt/clean/noisy staircase mask, GQA support.
 
 ## Project Structure
 
 ```
 fast_diffusion_attention/     # pip-installable package
-    __init__.py               # exports both public functions
+    __init__.py               # exports diff_attn_varlen_with_noisy_input
     diff_attn_noisy.py        # main kernel (fwd+bwd)
-    block_prefill_attention.py # staircase fwd-only kernel
     ref_mask.py               # reference mask generator
 tests/
     test_correctness.py       # correctness tests (fwd+bwd, fp16+bf16)
@@ -62,8 +59,8 @@ The kernel iterates over each range separately, skipping the gap.
 
 ### Usage
 ```python
-from fast_diffusion_attention import diff_attn_with_noisy_input
-output = diff_attn_with_noisy_input(
+from fast_diffusion_attention import diff_attn_varlen_with_noisy_input
+output = diff_attn_varlen_with_noisy_input(
     q, k, v,           # q: [T, n_q_heads, D], k/v: [T, n_kv_heads, D] fp16/bf16
     cu_seqlens,         # [batch+1] int32
     L0_arr, L1_arr,     # [batch] int32

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Manual kernel tuning for diff_attn_with_noisy_input on current GPU.
+Manual kernel tuning for diff_attn_varlen_with_noisy_input on current GPU.
 
 Sweeps (BLOCK_M, BLOCK_N, num_warps, num_stages) for each kernel
 (forward, dQ, dKdV) and head_dim (64, 128).

@@ -13,7 +13,7 @@ import math
 import gc
 import json
 import sys
-from fast_diffusion_attention import diff_attn_with_noisy_input
+from fast_diffusion_attention import diff_attn_varlen_with_noisy_input
 from flash_attn import flash_attn_varlen_func
 
 
@@ -92,7 +92,7 @@ def run_benchmark(mode="fwd"):
     results = []
 
     print(f"\n{'=' * 130}")
-    print(f"{title} BENCHMARK: diff_attn_with_noisy_input vs flash_attn_varlen_func (per-doc causal)")
+    print(f"{title} BENCHMARK: diff_attn_varlen_with_noisy_input vs flash_attn_varlen_func (per-doc causal)")
     print(f"NOTE: flash_attn uses SAME per-document cu_seqlens (fair comparison)")
     print(f"n_heads={n_heads}, head_dim={head_dim}, GPU: {torch.cuda.get_device_name()}")
     print(f"{'=' * 130}")
@@ -148,7 +148,7 @@ def run_benchmark(mode="fwd"):
 
         if mode == "fwd":
             def run_ours(q=qd, k=kd, v=vd, c=cu, a=l0a, b=l1a, s=S, m=total):
-                return diff_attn_with_noisy_input(q, k, v, c, a, b, s, max_seqlen=m)
+                return diff_attn_varlen_with_noisy_input(q, k, v, c, a, b, s, max_seqlen=m)
 
             def run_flash(q=qd, k=kd, v=vd, c=cu_flash, t=max_seqlen_flash):
                 return flash_attn_varlen_func(q, k, v, c, c, t, t, causal=True)
@@ -157,7 +157,7 @@ def run_benchmark(mode="fwd"):
                 qq = q.detach().requires_grad_(True)
                 kk = k.detach().requires_grad_(True)
                 vv = v.detach().requires_grad_(True)
-                diff_attn_with_noisy_input(qq, kk, vv, c, a, b, s, max_seqlen=m).sum().backward()
+                diff_attn_varlen_with_noisy_input(qq, kk, vv, c, a, b, s, max_seqlen=m).sum().backward()
 
             def run_flash(q=qd, k=kd, v=vd, c=cu_flash, t=max_seqlen_flash):
                 qq = q.detach().requires_grad_(True)

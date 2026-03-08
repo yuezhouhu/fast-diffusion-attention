@@ -1,8 +1,8 @@
-"""Correctness tests for diff_attn_with_noisy_input."""
+"""Correctness tests for diff_attn_varlen_with_noisy_input."""
 import torch
 import math
 
-from fast_diffusion_attention import diff_attn_with_noisy_input
+from fast_diffusion_attention import diff_attn_varlen_with_noisy_input
 from fast_diffusion_attention.ref_mask import build_full_mask
 
 
@@ -43,7 +43,7 @@ def test_forward_small():
 
     mask = build_full_mask(L0_list, L1_list, staircase_size).to(device)
     ref_out = naive_attention_with_mask(q, k, v, mask)
-    tri_out = diff_attn_with_noisy_input(q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size)
+    tri_out = diff_attn_varlen_with_noisy_input(q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size)
 
     max_diff = (ref_out.float() - tri_out.float()).abs().max().item()
     mean_diff = (ref_out.float() - tri_out.float()).abs().mean().item()
@@ -74,7 +74,7 @@ def test_forward_various_staircase():
 
         mask = build_full_mask([L0], [L1], staircase_size).to(device)
         ref_out = naive_attention_with_mask(q, k, v, mask)
-        tri_out = diff_attn_with_noisy_input(q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size)
+        tri_out = diff_attn_varlen_with_noisy_input(q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size)
 
         max_diff = (ref_out.float() - tri_out.float()).abs().max().item()
         print(f"[Forward staircase={staircase_size}] max_diff={max_diff:.6f}")
@@ -102,7 +102,7 @@ def test_forward_bfloat16():
 
     mask = build_full_mask([L0], [L1], staircase_size).to(device)
     ref_out = naive_attention_with_mask(q, k, v, mask)
-    tri_out = diff_attn_with_noisy_input(q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size)
+    tri_out = diff_attn_varlen_with_noisy_input(q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size)
 
     cos = torch.nn.functional.cosine_similarity(
         tri_out.float().reshape(-1), ref_out.float().reshape(-1), dim=0
@@ -146,7 +146,7 @@ def test_backward():
         L0_arr = torch.tensor([L0], dtype=torch.int32, device=device)
         L1_arr = torch.tensor([L1], dtype=torch.int32, device=device)
 
-        tri_out = diff_attn_with_noisy_input(q_tri, k_tri, v_tri, cu_seqlens, L0_arr, L1_arr, staircase_size)
+        tri_out = diff_attn_varlen_with_noisy_input(q_tri, k_tri, v_tri, cu_seqlens, L0_arr, L1_arr, staircase_size)
         tri_out.float().sum().backward()
 
         for name, g_ref, g_tri in [("dQ", q_ref.grad, q_tri.grad),
@@ -185,7 +185,7 @@ def test_gqa_forward():
         mask = build_full_mask([L0], [L1], staircase_size).to(device)
         ref_out = naive_attention_with_mask(q, k_exp, v_exp, mask)
 
-        tri_out = diff_attn_with_noisy_input(q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size)
+        tri_out = diff_attn_varlen_with_noisy_input(q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size)
 
         max_diff = (ref_out.float() - tri_out.float()).abs().max().item()
         print(f"[GQA Forward h={n_heads},kv={n_kv_heads}] max_diff={max_diff:.6f}")
@@ -231,7 +231,7 @@ def test_gqa_backward():
             L0_arr = torch.tensor([L0], dtype=torch.int32, device=device)
             L1_arr = torch.tensor([L1], dtype=torch.int32, device=device)
 
-            tri_out = diff_attn_with_noisy_input(q_tri, k_tri, v_tri, cu_seqlens, L0_arr, L1_arr, staircase_size)
+            tri_out = diff_attn_varlen_with_noisy_input(q_tri, k_tri, v_tri, cu_seqlens, L0_arr, L1_arr, staircase_size)
             tri_out.float().sum().backward()
 
             for name, g_ref, g_tri in [("dQ", q_ref.grad, q_tri.grad),
@@ -274,7 +274,7 @@ def test_gqa_multi_doc():
     mask = build_full_mask(L0_list, L1_list, staircase_size).to(device)
     ref_out = naive_attention_with_mask(q, k_exp, v_exp, mask)
 
-    tri_out = diff_attn_with_noisy_input(q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size)
+    tri_out = diff_attn_varlen_with_noisy_input(q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size)
 
     max_diff = (ref_out.float() - tri_out.float()).abs().max().item()
     print(f"[GQA Multi-doc] max_diff={max_diff:.6f}")

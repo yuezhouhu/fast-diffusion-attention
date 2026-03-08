@@ -1,7 +1,7 @@
 """
 Triton Flash Attention for Diffusion Language Model with noisy input.
 
-Provides ``diff_attn_with_noisy_input`` — a fused forward + backward kernel
+Provides ``diff_attn_varlen_with_noisy_input`` — a fused forward + backward kernel
 that implements the document-level staircase attention mask used in diffusion
 language model training.
 
@@ -33,7 +33,7 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["diff_attn_with_noisy_input"]
+__all__ = ["diff_attn_varlen_with_noisy_input"]
 
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _VALID_STAIRCASE_SIZES = (1, 2, 4, 8, 16, 32, 64)
@@ -593,7 +593,7 @@ def _diff_noisy_attn_bwd_dq_kernel(
 # ---------------------------------------------------------------------------
 
 class _DiffAttnNoisyFunction(torch.autograd.Function):
-    """Autograd function — not part of the public API; use :func:`diff_attn_with_noisy_input`."""
+    """Autograd function — not part of the public API; use :func:`diff_attn_varlen_with_noisy_input`."""
 
     @staticmethod
     def forward(ctx, q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size, max_seqlen,
@@ -716,7 +716,7 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
 # Public API
 # ---------------------------------------------------------------------------
 
-def diff_attn_with_noisy_input(
+def diff_attn_varlen_with_noisy_input(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -782,7 +782,7 @@ def diff_attn_with_noisy_input(
     Single document, staircase_size=4::
 
         import torch
-        from diff_attn_noisy import diff_attn_with_noisy_input
+        from diff_attn_noisy import diff_attn_varlen_with_noisy_input
 
         L0, L1, S = 128, 64, 4        # prompt=128, response=64, block=4
         total = L0 + 2 * L1           # 256 tokens
@@ -795,7 +795,7 @@ def diff_attn_with_noisy_input(
         L0_arr = torch.tensor([L0], dtype=torch.int32, device="cuda")
         L1_arr = torch.tensor([L1], dtype=torch.int32, device="cuda")
 
-        out = diff_attn_with_noisy_input(
+        out = diff_attn_varlen_with_noisy_input(
             q, k, v, cu_seqlens, L0_arr, L1_arr,
             staircase_size=S, max_seqlen=total,
         )
@@ -813,7 +813,7 @@ def diff_attn_with_noisy_input(
         L0_arr = torch.tensor(L0s, dtype=torch.int32, device="cuda")
         L1_arr = torch.tensor(L1s, dtype=torch.int32, device="cuda")
 
-        out = diff_attn_with_noisy_input(
+        out = diff_attn_varlen_with_noisy_input(
             q, k, v, cu_seqlens, L0_arr, L1_arr,
             staircase_size=4, max_seqlen=max(doc_lens),
         )

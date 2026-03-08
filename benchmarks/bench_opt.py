@@ -2,7 +2,7 @@
 import torch
 import math
 import gc
-from fast_diffusion_attention import diff_attn_with_noisy_input
+from fast_diffusion_attention import diff_attn_varlen_with_noisy_input
 from flash_attn import flash_attn_varlen_func
 
 
@@ -52,7 +52,7 @@ def main():
         l1a = torch.tensor([L1], dtype=torch.int32, device=device)
 
         def run_v1_fwd(q=q, k=k, v=v, cu=cu, a=l0a, b=l1a, s=S, m=actual):
-            return diff_attn_with_noisy_input(q.detach(), k.detach(), v.detach(), cu, a, b, s, max_seqlen=m)
+            return diff_attn_varlen_with_noisy_input(q.detach(), k.detach(), v.detach(), cu, a, b, s, max_seqlen=m)
 
         def run_flash_fwd(q=q, k=k, v=v, cu=cu, t=actual):
             return flash_attn_varlen_func(q.detach(), k.detach(), v.detach(), cu, cu, t, t, causal=True)
@@ -61,7 +61,7 @@ def main():
             qq = q.detach().requires_grad_(True)
             kk = k.detach().requires_grad_(True)
             vv = v.detach().requires_grad_(True)
-            diff_attn_with_noisy_input(qq, kk, vv, cu, a, b, s, max_seqlen=m).sum().backward()
+            diff_attn_varlen_with_noisy_input(qq, kk, vv, cu, a, b, s, max_seqlen=m).sum().backward()
 
         def run_flash_fb(q=q, k=k, v=v, cu=cu, t=actual):
             qq = q.detach().requires_grad_(True)

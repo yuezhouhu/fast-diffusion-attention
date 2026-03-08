@@ -1,11 +1,11 @@
-"""Benchmark GQA support: diff_attn_with_noisy_input vs flash_attn_varlen_func.
+"""Benchmark GQA support: diff_attn_varlen_with_noisy_input vs flash_attn_varlen_func.
 
 Tests both MHA (n_heads == n_kv_heads) and GQA (n_heads > n_kv_heads) configs.
 flash_attn uses the SAME per-document cu_seqlens for fair comparison.
 """
 import torch
 import gc
-from fast_diffusion_attention import diff_attn_with_noisy_input
+from fast_diffusion_attention import diff_attn_varlen_with_noisy_input
 from flash_attn import flash_attn_varlen_func
 
 
@@ -73,7 +73,7 @@ def main():
 
             if mode == "fwd":
                 def run_ours(q=q, k=k, v=v, cu=cu, a=l0a, b=l1a, s=S, m=actual):
-                    return diff_attn_with_noisy_input(q.detach(), k.detach(), v.detach(), cu, a, b, s, max_seqlen=m)
+                    return diff_attn_varlen_with_noisy_input(q.detach(), k.detach(), v.detach(), cu, a, b, s, max_seqlen=m)
 
                 def run_flash(q=q, k=k, v=v, cu=cu, t=actual):
                     return flash_attn_varlen_func(q.detach(), k.detach(), v.detach(), cu, cu, t, t, causal=True)
@@ -82,7 +82,7 @@ def main():
                     qq = q.detach().requires_grad_(True)
                     kk = k.detach().requires_grad_(True)
                     vv = v.detach().requires_grad_(True)
-                    diff_attn_with_noisy_input(qq, kk, vv, cu, a, b, s, max_seqlen=m).sum().backward()
+                    diff_attn_varlen_with_noisy_input(qq, kk, vv, cu, a, b, s, max_seqlen=m).sum().backward()
 
                 def run_flash(q=q, k=k, v=v, cu=cu, t=actual):
                     qq = q.detach().requires_grad_(True)
