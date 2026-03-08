@@ -160,9 +160,134 @@ def test_backward():
     print("[Backward] PASSED")
 
 
+def test_gqa_forward():
+    """Test forward pass with grouped-query attention (n_kv_heads < n_heads)."""
+    torch.manual_seed(77)
+    device = "cuda"
+    head_dim = 64
+    staircase_size = 4
+    L0, L1 = 16, 12
+    total = L0 + 2 * L1
+
+    for n_heads, n_kv_heads in [(4, 2), (8, 2), (8, 4), (16, 8)]:
+        n_kv_groups = n_heads // n_kv_heads
+        q = torch.randn(total, n_heads, head_dim, device=device, dtype=torch.float16)
+        k = torch.randn(total, n_kv_heads, head_dim, device=device, dtype=torch.float16)
+        v = torch.randn(total, n_kv_heads, head_dim, device=device, dtype=torch.float16)
+
+        cu_seqlens = torch.tensor([0, total], dtype=torch.int32, device=device)
+        L0_arr = torch.tensor([L0], dtype=torch.int32, device=device)
+        L1_arr = torch.tensor([L1], dtype=torch.int32, device=device)
+
+        # Reference: expand k/v to match q heads
+        k_exp = k.repeat_interleave(n_kv_groups, dim=1)
+        v_exp = v.repeat_interleave(n_kv_groups, dim=1)
+        mask = build_full_mask([L0], [L1], staircase_size).to(device)
+        ref_out = naive_attention_with_mask(q, k_exp, v_exp, mask)
+
+        tri_out = diff_attn_with_noisy_input(q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size)
+
+        max_diff = (ref_out.float() - tri_out.float()).abs().max().item()
+        print(f"[GQA Forward h={n_heads},kv={n_kv_heads}] max_diff={max_diff:.6f}")
+        assert max_diff < 0.01, f"GQA Forward h={n_heads},kv={n_kv_heads} FAILED: max_diff={max_diff}"
+    print("[GQA Forward] ALL PASSED")
+
+
+def test_gqa_backward():
+    """Test backward pass with grouped-query attention."""
+    torch.manual_seed(42)
+    device = "cuda"
+    staircase_size = 4
+    L0, L1 = 16, 12
+    total = L0 + 2 * L1
+
+    for n_heads, n_kv_heads, head_dim in [(4, 2, 64), (16, 8, 128)]:
+        n_kv_groups = n_heads // n_kv_heads
+
+        # Reference in float32 with expanded k/v
+        q_ref = torch.randn(total, n_heads, head_dim, device=device, dtype=torch.float32, requires_grad=True)
+        k_ref_small = torch.randn(total, n_kv_heads, head_dim, device=device, dtype=torch.float32, requires_grad=True)
+        v_ref_small = torch.randn(total, n_kv_heads, head_dim, device=device, dtype=torch.float32, requires_grad=True)
+
+        k_ref = k_ref_small.repeat_interleave(n_kv_groups, dim=1)
+        v_ref = v_ref_small.repeat_interleave(n_kv_groups, dim=1)
+
+        mask = build_full_mask([L0], [L1], staircase_size).to(device)
+        scale = 1.0 / math.sqrt(head_dim)
+        qk = torch.einsum("ihd,jhd->hij", q_ref, k_ref) * scale
+        mask_expanded = mask.unsqueeze(0).expand(n_heads, -1, -1)
+        qk = qk.masked_fill(~mask_expanded, -1e9)
+        attn = torch.softmax(qk, dim=-1)
+        ref_out = torch.einsum("hij,jhd->ihd", attn, v_ref)
+        ref_out.sum().backward()
+
+        # Triton kernel
+        for dtype_name, dtype in [("fp16", torch.float16), ("bf16", torch.bfloat16)]:
+            q_tri = q_ref.detach().clone().to(dtype).requires_grad_(True)
+            k_tri = k_ref_small.detach().clone().to(dtype).requires_grad_(True)
+            v_tri = v_ref_small.detach().clone().to(dtype).requires_grad_(True)
+
+            cu_seqlens = torch.tensor([0, total], dtype=torch.int32, device=device)
+            L0_arr = torch.tensor([L0], dtype=torch.int32, device=device)
+            L1_arr = torch.tensor([L1], dtype=torch.int32, device=device)
+
+            tri_out = diff_attn_with_noisy_input(q_tri, k_tri, v_tri, cu_seqlens, L0_arr, L1_arr, staircase_size)
+            tri_out.float().sum().backward()
+
+            for name, g_ref, g_tri in [("dQ", q_ref.grad, q_tri.grad),
+                                         ("dK", k_ref_small.grad, k_tri.grad),
+                                         ("dV", v_ref_small.grad, v_tri.grad)]:
+                cos_sim = torch.nn.functional.cosine_similarity(
+                    g_ref.float().reshape(-1), g_tri.float().reshape(-1), dim=0
+                ).item()
+                print(f"[GQA Backward h={n_heads},kv={n_kv_heads},d={head_dim} {dtype_name} {name}] cos_sim={cos_sim:.6f}")
+                assert cos_sim > 0.95, f"GQA Backward h={n_heads},kv={n_kv_heads} {dtype_name} {name} FAILED: cos_sim={cos_sim}"
+    print("[GQA Backward] ALL PASSED")
+
+
+def test_gqa_multi_doc():
+    """Test GQA with multiple documents packed in one batch."""
+    torch.manual_seed(123)
+    device = "cuda"
+    n_heads, n_kv_heads = 8, 4
+    n_kv_groups = n_heads // n_kv_heads
+    head_dim = 64
+    staircase_size = 2
+
+    L0_list = [4, 2]
+    L1_list = [6, 2]
+    doc_lens = [L0 + 2 * L1 for L0, L1 in zip(L0_list, L1_list)]
+    total_tokens = sum(doc_lens)
+
+    q = torch.randn(total_tokens, n_heads, head_dim, device=device, dtype=torch.float16)
+    k = torch.randn(total_tokens, n_kv_heads, head_dim, device=device, dtype=torch.float16)
+    v = torch.randn(total_tokens, n_kv_heads, head_dim, device=device, dtype=torch.float16)
+
+    cu_seqlens = torch.tensor([0] + [sum(doc_lens[:i+1]) for i in range(len(doc_lens))],
+                               dtype=torch.int32, device=device)
+    L0_arr = torch.tensor(L0_list, dtype=torch.int32, device=device)
+    L1_arr = torch.tensor(L1_list, dtype=torch.int32, device=device)
+
+    # Reference with expanded k/v
+    k_exp = k.repeat_interleave(n_kv_groups, dim=1)
+    v_exp = v.repeat_interleave(n_kv_groups, dim=1)
+    mask = build_full_mask(L0_list, L1_list, staircase_size).to(device)
+    ref_out = naive_attention_with_mask(q, k_exp, v_exp, mask)
+
+    tri_out = diff_attn_with_noisy_input(q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size)
+
+    max_diff = (ref_out.float() - tri_out.float()).abs().max().item()
+    print(f"[GQA Multi-doc] max_diff={max_diff:.6f}")
+    assert max_diff < 0.01, f"GQA Multi-doc FAILED: max_diff={max_diff}"
+    print("[GQA Multi-doc] PASSED")
+
+
 if __name__ == "__main__":
     test_forward_small()
     test_forward_various_staircase()
     test_forward_bfloat16()
     test_backward()
+    test_gqa_forward()
+    test_gqa_backward()
+    test_gqa_multi_doc()
     print("\nAll tests passed!")

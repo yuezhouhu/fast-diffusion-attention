@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Pip-installable Python package (`fast_diffusion_attention`) providing GPU-accelerated attention kernels for diffusion LM training, implemented with Triton.
 
 Two public functions:
-1. `diff_attn_with_noisy_input` — forward+backward, full prompt/clean/noisy staircase mask
+1. `diff_attn_with_noisy_input` — forward+backward, full prompt/clean/noisy staircase mask, GQA support
 2. `diff_attn_varlen_v2` — forward-only staircase attention with GQA support
 
 ## Project Structure
@@ -60,12 +60,13 @@ The kernel iterates over each range separately, skipping the gap.
 ```python
 from fast_diffusion_attention import diff_attn_with_noisy_input
 output = diff_attn_with_noisy_input(
-    q, k, v,           # [total_tokens, n_heads, head_dim] fp16/bf16
+    q, k, v,           # q: [T, n_q_heads, D], k/v: [T, n_kv_heads, D] fp16/bf16
     cu_seqlens,         # [batch+1] int32
     L0_arr, L1_arr,     # [batch] int32
     staircase_size=4,   # 1,2,4,8,16,32,64
     max_seqlen=total,   # always pass to avoid GPU sync
 )
+# GQA: n_q_heads must be divisible by n_kv_heads
 ```
 
 ## Key Implementation Notes
@@ -75,6 +76,7 @@ output = diff_attn_with_noisy_input(
 - LSE stored in float32; backward D_i precomputed in float32
 - `max_seqlen` avoids `.item()` GPU sync — always pass it
 - dkdv backward uses gap-skipping for clean key tiles
+- GQA: fwd/dQ use `pid_kv = pid_h // N_KV_GROUPS` for K/V access; dKdV parallelizes across Q heads then reduces
 - Forward: BLOCK_M=128, BLOCK_N=64; Backward: BLOCK_M=64, BLOCK_N=64
 
 ## Environment

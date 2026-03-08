@@ -6,9 +6,9 @@ GPU-accelerated attention kernels for diffusion language model training, impleme
 
 - **Staircase block-causal attention** tailored for the prompt / clean-response / noisy-response layout used in diffusion LM training
 - Forward + backward support for end-to-end training
+- **Grouped-Query Attention (GQA)**: `n_q_heads` can differ from `n_kv_heads` (e.g., 16 Q heads, 8 KV heads)
 - Supports `float16` and `bfloat16`
 - Variable-length sequences packed in a single batch (`varlen` style, same as `flash_attn_varlen_func`)
-- Forward pass is **10-20% faster** than `flash_attn_varlen_func` (causal) on equivalent inputs
 
 ## Installation
 
@@ -69,8 +69,8 @@ Fused multi-head attention with the diffusion noisy-input staircase mask. Suppor
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `q` | `Tensor [T, H, D]` | Query tensor. dtype: `float16` or `bfloat16`. |
-| `k` | `Tensor [T, H, D]` | Key tensor. Same dtype as `q`. |
-| `v` | `Tensor [T, H, D]` | Value tensor. Same dtype as `q`. |
+| `k` | `Tensor [T, Hkv, D]` | Key tensor. `H` must be divisible by `Hkv` (GQA). Same dtype as `q`. |
+| `v` | `Tensor [T, Hkv, D]` | Value tensor. Same shape as `k`. |
 | `cu_seqlens` | `Tensor [B+1]` | Cumulative sequence lengths, `int32`. E.g., `[0, 256, 512]` for two 256-token docs. |
 | `L0_arr` | `Tensor [B]` | Prompt length per document, `int32`. |
 | `L1_arr` | `Tensor [B]` | Response length per document, `int32`. Each doc has `L0 + 2*L1` total tokens. |
@@ -193,11 +193,11 @@ from fast_diffusion_attention import diff_attn_with_noisy_input
 
 L0, L1, S = 512, 256, 8
 total = L0 + 2 * L1
-n_heads, head_dim = 32, 128
+n_q_heads, n_kv_heads, head_dim = 16, 8, 128  # GQA: 2 Q heads per KV head
 
-q = torch.randn(total, n_heads, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-k = torch.randn_like(q, requires_grad=True)
-v = torch.randn_like(q, requires_grad=True)
+q = torch.randn(total, n_q_heads, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+k = torch.randn(total, n_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+v = torch.randn(total, n_kv_heads, head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
 cu = torch.tensor([0, total], dtype=torch.int32, device="cuda")
 l0 = torch.tensor([L0], dtype=torch.int32, device="cuda")
@@ -214,33 +214,30 @@ loss.backward()
 
 ## Performance
 
-Benchmarked on NVIDIA RTX A6000, n_heads=16, head_dim=64, float16.
+Benchmarked on NVIDIA RTX A6000, float16, staircase_size=4.
 Compared against `flash_attn_varlen_func(causal=True)` using **identical** per-document `cu_seqlens` (fair comparison — both kernels skip cross-document attention).
 
-**Forward pass** (ratio = ours / flash, lower is better):
+Ratio = ours / flash (lower is better).
 
-| Sequence length | Ratio |
-|-----------------|-------|
-| 1024 | 0.93x |
-| 2048 | 0.87x |
-| 4096 | 0.92x |
-| 6144 | 0.91x |
-| 8192 | 0.95x |
+**MHA** (n_heads=16, head_dim=64):
 
-Forward is consistently faster across all tested configurations (256–16384 tokens, staircase sizes 1–64, 1–8 documents).
+| Seq length | Forward | Fwd+Bwd |
+|------------|---------|---------|
+| 1024 | **1.00x** | **0.68x** |
+| 2048 | 1.51x | 1.24x |
+| 4096 | 1.56x | 2.88x |
+| 8192 | 1.50x | 2.94x |
 
-**Forward + backward** (ratio = ours / flash):
+**GQA** (n_q_heads=16, n_kv_heads=8, head_dim=128):
 
-| Sequence length | Ratio |
-|-----------------|-------|
-| 2048 | ~1.0x |
-| 4096 | ~1.2x |
-| 6144 | ~1.35x |
-| 8192 | ~1.37x |
+| Seq length | Forward | Fwd+Bwd |
+|------------|---------|---------|
+| 1024 | 1.22x | 1.22x |
+| 2048 | 2.33x | 1.06x |
+| 4096 | 1.80x | 3.02x |
+| 8192 | 1.62x | 2.97x |
 
-The backward pass is the current bottleneck for large sequences.
-
-Run `python benchmarks/bench_comprehensive.py` to reproduce.
+Run `python benchmarks/bench_gqa.py` to reproduce.
 
 ## Tips
 

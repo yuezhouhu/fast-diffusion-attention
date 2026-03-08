@@ -85,10 +85,12 @@ def _diff_noisy_attn_fwd_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     LOG2S: tl.constexpr,
+    N_KV_GROUPS: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_h = tl.program_id(1)
     pid_doc = tl.program_id(2)
+    pid_kv = pid_h // N_KV_GROUPS
 
     seq_start = tl.load(cu_seqlens + pid_doc).to(tl.int32)
     seq_end = tl.load(cu_seqlens + pid_doc + 1).to(tl.int32)
@@ -120,8 +122,8 @@ def _diff_noisy_attn_fwd_kernel(
     l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
 
-    K_ptr = K + pid_h * stride_kh
-    V_ptr = V + pid_h * stride_vh
+    K_ptr = K + pid_kv * stride_kh
+    V_ptr = V + pid_kv * stride_vh
 
     # --- Range1 loop: [0, max_upper1) ---
     max_upper1 = tl.max(tl.where(m_valid, upper1, 0))
@@ -237,16 +239,19 @@ def _diff_noisy_attn_bwd_dkdv_kernel(
     stride_kt, stride_kh, stride_kd,
     stride_vt, stride_vh, stride_vd,
     stride_ot, stride_oh, stride_od,
+    stride_dkt, stride_dkh, stride_dkd,
     n_heads: tl.constexpr,
     sm_scale,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     LOG2S: tl.constexpr,
+    N_KV_GROUPS: tl.constexpr,
 ):
     pid_n = tl.program_id(0)
-    pid_h = tl.program_id(1)
+    pid_h = tl.program_id(1)     # Q head index
     pid_doc = tl.program_id(2)
+    pid_kv = pid_h // N_KV_GROUPS  # corresponding KV head
 
     seq_start = tl.load(cu_seqlens + pid_doc).to(tl.int32)
     seq_end = tl.load(cu_seqlens + pid_doc + 1).to(tl.int32)
@@ -262,8 +267,8 @@ def _diff_noisy_attn_bwd_dkdv_kernel(
     n_valid = offs_n < doc_len
 
     k_abs = seq_start + start_n
-    K_ptr = K + pid_h * stride_kh
-    V_ptr = V + pid_h * stride_vh
+    K_ptr = K + pid_kv * stride_kh
+    V_ptr = V + pid_kv * stride_vh
 
     K_block_ptr = tl.make_block_ptr(
         base=K_ptr, shape=(seq_end, BLOCK_D),
@@ -377,16 +382,17 @@ def _diff_noisy_attn_bwd_dkdv_kernel(
             ds = tl.where(mask, ds, 0.0)
             dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
 
-    dK_ptr = dK + pid_h * stride_kh
-    dV_ptr = dV + pid_h * stride_vh
+    # Write partial dK/dV for this Q head (reduced across Q heads later)
+    dK_ptr = dK + pid_h * stride_dkh
+    dV_ptr = dV + pid_h * stride_dkh
     dK_block_ptr = tl.make_block_ptr(
         base=dK_ptr, shape=(seq_end, BLOCK_D),
-        strides=(stride_kt, stride_kd), offsets=(k_abs, 0),
+        strides=(stride_dkt, stride_dkd), offsets=(k_abs, 0),
         block_shape=(BLOCK_N, BLOCK_D), order=(1, 0),
     )
     dV_block_ptr = tl.make_block_ptr(
         base=dV_ptr, shape=(seq_end, BLOCK_D),
-        strides=(stride_vt, stride_vd), offsets=(k_abs, 0),
+        strides=(stride_dkt, stride_dkd), offsets=(k_abs, 0),
         block_shape=(BLOCK_N, BLOCK_D), order=(1, 0),
     )
     tl.store(dK_block_ptr, dk.to(k.dtype), boundary_check=(0,))
@@ -411,10 +417,12 @@ def _diff_noisy_attn_bwd_dq_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
     LOG2S: tl.constexpr,
+    N_KV_GROUPS: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_h = tl.program_id(1)
     pid_doc = tl.program_id(2)
+    pid_kv = pid_h // N_KV_GROUPS
 
     seq_start = tl.load(cu_seqlens + pid_doc).to(tl.int32)
     seq_end = tl.load(cu_seqlens + pid_doc + 1).to(tl.int32)
@@ -457,8 +465,8 @@ def _diff_noisy_attn_bwd_dq_kernel(
 
     dq = tl.zeros([BLOCK_M, BLOCK_D], dtype=tl.float32)
 
-    K_ptr = K + pid_h * stride_kh
-    V_ptr = V + pid_h * stride_vh
+    K_ptr = K + pid_kv * stride_kh
+    V_ptr = V + pid_kv * stride_vh
 
     # --- Range1 loop ---
     max_upper1 = tl.max(tl.where(m_valid, upper1, 0))
@@ -559,6 +567,8 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
     def forward(ctx, q, k, v, cu_seqlens, L0_arr, L1_arr, staircase_size, max_seqlen,
                 scale, dropout_p):
         total_tokens, n_heads, head_dim = q.shape
+        n_kv_heads = k.shape[1]
+        n_kv_groups = n_heads // n_kv_heads
         log2s = int(math.log2(staircase_size))
 
         sm_scale = scale * 1.44269504  # scale * log2(e) for exp2-based softmax
@@ -598,6 +608,7 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
             o.stride(0), o.stride(1), o.stride(2),
             n_heads=n_heads, sm_scale=sm_scale,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, LOG2S=log2s,
+            N_KV_GROUPS=n_kv_groups,
             num_warps=8, num_stages=fwd_num_stages,
         )
 
@@ -607,6 +618,7 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
         ctx.n_heads = n_heads
         ctx.BLOCK_D = BLOCK_D
         ctx.max_seqlen = max_seqlen
+        ctx.n_kv_heads = n_kv_heads
         return o
 
     @staticmethod
@@ -616,8 +628,11 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
         log2s = ctx.log2s
         n_heads = ctx.n_heads
         BLOCK_D = ctx.BLOCK_D
+        n_kv_heads = ctx.n_kv_heads
+        n_kv_groups = n_heads // n_kv_heads
 
         do = do.contiguous()
+        total_tokens = q.shape[0]
         batch_size = cu_seqlens.numel() - 1
         max_doc_len = ctx.max_seqlen
 
@@ -638,8 +653,6 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
         D = (do.float() * o.float()).sum(dim=-1)
 
         dq = torch.empty_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
 
         # --- dQ kernel ---
         num_m_tiles = (max_doc_len + BLOCK_M_DQ - 1) // BLOCK_M_DQ
@@ -653,23 +666,39 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
             o.stride(0), o.stride(1), o.stride(2),
             n_heads=n_heads, sm_scale=sm_scale,
             BLOCK_M=BLOCK_M_DQ, BLOCK_N=BLOCK_N_DQ, BLOCK_D=BLOCK_D, LOG2S=log2s,
+            N_KV_GROUPS=n_kv_groups,
             num_warps=4, num_stages=bwd_num_stages,
         )
 
         # --- dK, dV kernel ---
+        # Each Q head writes its partial dK/dV independently; reduced after.
+        dk_buf = torch.zeros(total_tokens, n_heads, BLOCK_D,
+                             dtype=k.dtype, device=k.device)
+        dv_buf = torch.zeros(total_tokens, n_heads, BLOCK_D,
+                             dtype=v.dtype, device=v.device)
         num_n_tiles = (max_doc_len + BLOCK_N_DKDV - 1) // BLOCK_N_DKDV
         grid_dkdv = (num_n_tiles, n_heads, batch_size)
         _diff_noisy_attn_bwd_dkdv_kernel[grid_dkdv](
-            q, k, v, o, do, dk, dv, lse, D,
+            q, k, v, o, do, dk_buf, dv_buf, lse, D,
             cu_seqlens, L0_arr, L1_arr,
             q.stride(0), q.stride(1), q.stride(2),
             k.stride(0), k.stride(1), k.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
             o.stride(0), o.stride(1), o.stride(2),
+            dk_buf.stride(0), dk_buf.stride(1), dk_buf.stride(2),
             n_heads=n_heads, sm_scale=sm_scale,
             BLOCK_M=BLOCK_M_DKDV, BLOCK_N=BLOCK_N_DKDV, BLOCK_D=BLOCK_D, LOG2S=log2s,
+            N_KV_GROUPS=n_kv_groups,
             num_warps=4, num_stages=bwd_num_stages,
         )
+
+        # Reduce partial dK/dV across Q heads sharing each KV head
+        if n_kv_groups == 1:
+            dk = dk_buf
+            dv = dv_buf
+        else:
+            dk = dk_buf.view(total_tokens, n_kv_heads, n_kv_groups, BLOCK_D).sum(dim=2)
+            dv = dv_buf.view(total_tokens, n_kv_heads, n_kv_groups, BLOCK_D).sum(dim=2)
 
         return dq, dk, dv, None, None, None, None, None, None, None
 
@@ -785,6 +814,20 @@ def diff_attn_with_noisy_input(
         raise ValueError(
             f"q, k, v must be 3-D (total_tokens, n_heads, head_dim), "
             f"got dims {q.dim()}, {k.dim()}, {v.dim()}"
+        )
+    if k.shape != v.shape:
+        raise ValueError(
+            f"k and v must have the same shape, got k={k.shape}, v={v.shape}"
+        )
+    if q.shape[0] != k.shape[0] or q.shape[2] != k.shape[2]:
+        raise ValueError(
+            f"q and k/v must match in total_tokens (dim 0) and head_dim (dim 2), "
+            f"got q={q.shape}, k={k.shape}"
+        )
+    n_q_heads, n_kv_heads = q.shape[1], k.shape[1]
+    if n_q_heads % n_kv_heads != 0:
+        raise ValueError(
+            f"n_q_heads ({n_q_heads}) must be divisible by n_kv_heads ({n_kv_heads})"
         )
     if q.dtype not in _SUPPORTED_DTYPES:
         raise ValueError(
