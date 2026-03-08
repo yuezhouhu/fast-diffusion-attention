@@ -572,6 +572,17 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
         BLOCK_N = 64
         BLOCK_D = head_dim
 
+        # Dynamically choose num_stages to stay within GPU shared memory limits.
+        # Each pipeline stage buffers a BLOCK_N × BLOCK_D tile for both K and V
+        # (2 bytes per element for fp16/bf16).  More stages improve latency
+        # hiding but increase shared memory usage.
+        if head_dim <= 64:
+            fwd_num_stages = 3
+        elif head_dim <= 128:
+            fwd_num_stages = 2
+        else:
+            fwd_num_stages = 1
+
         # LSE is always stored in float32 for numerical stability.
         lse = torch.empty(total_tokens, n_heads, dtype=torch.float32, device=q.device)
 
@@ -587,7 +598,7 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
             o.stride(0), o.stride(1), o.stride(2),
             n_heads=n_heads, sm_scale=sm_scale,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, LOG2S=log2s,
-            num_warps=8, num_stages=3,
+            num_warps=8, num_stages=fwd_num_stages,
         )
 
         ctx.save_for_backward(q, k, v, o, lse, cu_seqlens, L0_arr, L1_arr)
@@ -615,6 +626,14 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
         BLOCK_M_DKDV = 64
         BLOCK_N_DKDV = 64
 
+        # Dynamic num_stages for backward kernels (same logic as forward).
+        if BLOCK_D <= 64:
+            bwd_num_stages = 3
+        elif BLOCK_D <= 128:
+            bwd_num_stages = 2
+        else:
+            bwd_num_stages = 1
+
         # D_i = sum_d (dO_i * O_i)  — precomputed for the backward softmax trick.
         D = (do.float() * o.float()).sum(dim=-1)
 
@@ -634,7 +653,7 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
             o.stride(0), o.stride(1), o.stride(2),
             n_heads=n_heads, sm_scale=sm_scale,
             BLOCK_M=BLOCK_M_DQ, BLOCK_N=BLOCK_N_DQ, BLOCK_D=BLOCK_D, LOG2S=log2s,
-            num_warps=4, num_stages=3,
+            num_warps=4, num_stages=bwd_num_stages,
         )
 
         # --- dK, dV kernel ---
@@ -649,7 +668,7 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
             o.stride(0), o.stride(1), o.stride(2),
             n_heads=n_heads, sm_scale=sm_scale,
             BLOCK_M=BLOCK_M_DKDV, BLOCK_N=BLOCK_N_DKDV, BLOCK_D=BLOCK_D, LOG2S=log2s,
-            num_warps=4, num_stages=3,
+            num_warps=4, num_stages=bwd_num_stages,
         )
 
         return dq, dk, dv, None, None, None, None, None, None, None
