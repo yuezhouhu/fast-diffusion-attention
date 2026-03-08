@@ -38,6 +38,38 @@ __all__ = ["diff_attn_with_noisy_input"]
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _VALID_STAIRCASE_SIZES = (1, 2, 4, 8, 16, 32, 64)
 
+# ---------------------------------------------------------------------------
+# Tuned kernel configs: (cc_major, head_dim) -> kernel -> (BM, BN, warps, stages)
+# Fallback to _DEFAULT_CONFIGS for architectures without tuned values.
+# ---------------------------------------------------------------------------
+_TUNED_CONFIGS = {
+    # Ampere (sm_86: A6000 / RTX 3090; also used for sm_80: A100)
+    (8, 64): {
+        "fwd":  (64,  32, 4, 1),
+        "dq":   (32,  64, 4, 1),
+        "dkdv": (32,  32, 2, 1),
+    },
+    (8, 128): {
+        "fwd":  (128, 32, 4, 1),
+        "dq":   (32,  64, 4, 1),
+        "dkdv": (32,  32, 4, 3),
+    },
+}
+
+def _get_kernel_config(head_dim: int, kernel: str):
+    """Return (BLOCK_M, BLOCK_N, num_warps, num_stages) for *kernel*."""
+    cc_major = torch.cuda.get_device_capability()[0]
+    key = (cc_major, head_dim)
+    if key in _TUNED_CONFIGS and kernel in _TUNED_CONFIGS[key]:
+        return _TUNED_CONFIGS[key][kernel]
+    # Generic fallback — conservative settings that work on all GPUs.
+    if kernel == "fwd":
+        ns = 3 if head_dim <= 64 else 2 if head_dim <= 128 else 1
+        return (128, 64, 8, ns)
+    else:
+        ns = 3 if head_dim <= 64 else 2 if head_dim <= 128 else 1
+        return (64, 64, 4, ns)
+
 
 # ---------------------------------------------------------------------------
 # Helper — compute per-row mask ranges
@@ -577,21 +609,8 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
         o = torch.empty_like(q)
 
         batch_size = cu_seqlens.numel() - 1
-
-        BLOCK_M = 128
-        BLOCK_N = 64
         BLOCK_D = head_dim
-
-        # Dynamically choose num_stages to stay within GPU shared memory limits.
-        # Each pipeline stage buffers a BLOCK_N × BLOCK_D tile for both K and V
-        # (2 bytes per element for fp16/bf16).  More stages improve latency
-        # hiding but increase shared memory usage.
-        if head_dim <= 64:
-            fwd_num_stages = 3
-        elif head_dim <= 128:
-            fwd_num_stages = 2
-        else:
-            fwd_num_stages = 1
+        BLOCK_M, BLOCK_N, fwd_num_warps, fwd_num_stages = _get_kernel_config(head_dim, "fwd")
 
         # LSE is always stored in float32 for numerical stability.
         lse = torch.empty(total_tokens, n_heads, dtype=torch.float32, device=q.device)
@@ -609,7 +628,7 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
             n_heads=n_heads, sm_scale=sm_scale,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_D, LOG2S=log2s,
             N_KV_GROUPS=n_kv_groups,
-            num_warps=8, num_stages=fwd_num_stages,
+            num_warps=fwd_num_warps, num_stages=fwd_num_stages,
         )
 
         ctx.save_for_backward(q, k, v, o, lse, cu_seqlens, L0_arr, L1_arr)
@@ -636,18 +655,8 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
         batch_size = cu_seqlens.numel() - 1
         max_doc_len = ctx.max_seqlen
 
-        BLOCK_M_DQ = 64
-        BLOCK_N_DQ = 64
-        BLOCK_M_DKDV = 64
-        BLOCK_N_DKDV = 64
-
-        # Dynamic num_stages for backward kernels (same logic as forward).
-        if BLOCK_D <= 64:
-            bwd_num_stages = 3
-        elif BLOCK_D <= 128:
-            bwd_num_stages = 2
-        else:
-            bwd_num_stages = 1
+        BLOCK_M_DQ, BLOCK_N_DQ, dq_num_warps, dq_num_stages = _get_kernel_config(BLOCK_D, "dq")
+        BLOCK_M_DKDV, BLOCK_N_DKDV, dkdv_num_warps, dkdv_num_stages = _get_kernel_config(BLOCK_D, "dkdv")
 
         # D_i = sum_d (dO_i * O_i)  — precomputed for the backward softmax trick.
         D = (do.float() * o.float()).sum(dim=-1)
@@ -667,7 +676,7 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
             n_heads=n_heads, sm_scale=sm_scale,
             BLOCK_M=BLOCK_M_DQ, BLOCK_N=BLOCK_N_DQ, BLOCK_D=BLOCK_D, LOG2S=log2s,
             N_KV_GROUPS=n_kv_groups,
-            num_warps=4, num_stages=bwd_num_stages,
+            num_warps=dq_num_warps, num_stages=dq_num_stages,
         )
 
         # --- dK, dV kernel ---
@@ -689,7 +698,7 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
             n_heads=n_heads, sm_scale=sm_scale,
             BLOCK_M=BLOCK_M_DKDV, BLOCK_N=BLOCK_N_DKDV, BLOCK_D=BLOCK_D, LOG2S=log2s,
             N_KV_GROUPS=n_kv_groups,
-            num_warps=4, num_stages=bwd_num_stages,
+            num_warps=dkdv_num_warps, num_stages=dkdv_num_stages,
         )
 
         # Reduce partial dK/dV across Q heads sharing each KV head

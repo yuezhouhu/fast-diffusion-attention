@@ -214,8 +214,10 @@ loss.backward()
 
 ## Performance
 
-Benchmarked on NVIDIA RTX A6000, float16, staircase_size=4.
+Benchmarked on NVIDIA RTX A6000 (Ampere, sm_86), float16, staircase_size=4.
 Compared against `flash_attn_varlen_func(causal=True)` using **identical** per-document `cu_seqlens` (fair comparison — both kernels skip cross-document attention).
+
+Kernel block sizes and launch parameters are **manually tuned per compute capability**. Tuned configs are currently available for Ampere (sm_8x: A6000, A100, RTX 3090, etc.). Other architectures fall back to conservative defaults.
 
 Ratio = ours / flash (lower is better).
 
@@ -223,21 +225,33 @@ Ratio = ours / flash (lower is better).
 
 | Seq length | Forward | Fwd+Bwd |
 |------------|---------|---------|
-| 1024 | **1.00x** | **0.68x** |
-| 2048 | 1.51x | 1.24x |
-| 4096 | 1.56x | 2.88x |
-| 8192 | 1.50x | 2.94x |
+| 1024 | **1.08x** | **1.16x** |
+| 2048 | **1.01x** | 1.25x |
+| 4096 | **1.04x** | 1.26x |
+| 8192 | **1.06x** | 1.59x |
 
 **GQA** (n_q_heads=16, n_kv_heads=8, head_dim=128):
 
 | Seq length | Forward | Fwd+Bwd |
 |------------|---------|---------|
-| 1024 | 1.22x | 1.22x |
-| 2048 | 2.33x | 1.06x |
-| 4096 | 1.80x | 3.02x |
-| 8192 | 1.62x | 2.97x |
+| 1024 | **0.41x** | 1.27x |
+| 2048 | **0.92x** | 1.25x |
+| 4096 | **1.38x** | 1.62x |
+| 8192 | **1.14x** | 1.56x |
 
 Run `python benchmarks/bench_gqa.py` to reproduce.
+
+## Kernel Tuning
+
+Block sizes (`BLOCK_M`, `BLOCK_N`), `num_warps`, and `num_stages` are tuned offline per GPU architecture (keyed by compute capability major version and head_dim). This avoids `@triton.autotune` overhead from variable sequence lengths during training.
+
+Tuned configs are stored in `_TUNED_CONFIGS` in `fast_diffusion_attention/diff_attn_noisy.py`. To tune for a new GPU:
+
+```bash
+python benchmarks/tune_kernels.py
+```
+
+Copy the output dict into `_TUNED_CONFIGS`.
 
 ## Tips
 

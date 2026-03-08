@@ -21,7 +21,8 @@ fast_diffusion_attention/     # pip-installable package
 tests/
     test_correctness.py       # correctness tests (fwd+bwd, fp16+bf16)
 benchmarks/
-    bench_comprehensive.py    # vs flash_attn_varlen_func
+    bench_gqa.py              # vs flash_attn_varlen_func
+    tune_kernels.py           # manual tuning script
 docs/
     技术规格书.md              # original spec
 pyproject.toml
@@ -38,7 +39,10 @@ pip install -e .
 python tests/test_correctness.py
 
 # Run benchmarks
-python benchmarks/bench_comprehensive.py
+python benchmarks/bench_gqa.py
+
+# Tune kernels for current GPU (results go into _TUNED_CONFIGS)
+python benchmarks/tune_kernels.py
 ```
 
 ## Architecture
@@ -77,7 +81,9 @@ output = diff_attn_with_noisy_input(
 - `max_seqlen` avoids `.item()` GPU sync — always pass it
 - dkdv backward uses gap-skipping for clean key tiles
 - GQA: fwd/dQ use `pid_kv = pid_h // N_KV_GROUPS` for K/V access; dKdV parallelizes across Q heads then reduces
-- Forward: BLOCK_M=128, BLOCK_N=64; Backward: BLOCK_M=64, BLOCK_N=64
+- Block sizes and launch params are tuned per (cc_major, head_dim) via `_TUNED_CONFIGS` / `_get_kernel_config()`
+- Ampere (sm_8x) tuned: fwd BM=64/128 BN=32, dq BM=32 BN=64, dkdv BM=32 BN=32
+- Fallback for unknown GPUs: fwd BM=128 BN=64 W=8, bwd BM=64 BN=64 W=4
 
 ## Environment
 
