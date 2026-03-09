@@ -18,7 +18,8 @@ fast_diffusion_attention/     # pip-installable package
 tests/
     test_correctness.py       # correctness tests (fwd+bwd, fp16+bf16)
 benchmarks/
-    bench_gqa.py              # vs flash_attn_varlen_func
+    bench_gqa.py              # vs flash_attn_varlen_func (single-doc)
+    bench_long.py             # vs flash_attn_varlen_func (multi-doc 30-50k tokens)
     tune_kernels.py           # manual tuning script
 docs/
     技术规格书.md              # original spec
@@ -55,7 +56,7 @@ Per-document layout: `[Prompt(L0), CleanResponse(L1), NoisyResponse(L1)]`
 **Key optimization**: each query row's visible keys form at most 2 contiguous ranges.
 The kernel iterates over each range separately, skipping the gap.
 
-**Kernels**: `_diff_noisy_attn_fwd_kernel`, `_diff_noisy_attn_bwd_dq_kernel`, `_diff_noisy_attn_bwd_dkdv_kernel`
+**Kernels**: `_diff_noisy_attn_fwd_kernel`, `_diff_noisy_attn_bwd_dq_kernel`, `_diff_noisy_attn_bwd_dkdv_kernel`, `_compute_delta_kernel`
 
 ### Usage
 ```python
@@ -74,12 +75,14 @@ output = diff_attn_varlen_with_noisy_input(
 
 - Supported dtypes: `float16`, `bfloat16`. Input validation raises `ValueError` for others.
 - `sm_scale` includes `* 1.44269504` (log2(e)) for exp2-based online softmax
-- LSE stored in float32; backward D_i precomputed in float32
+- LSE stored in **log2 domain** (float32); backward uses exp2 throughout
+- D_i computed via fused `_compute_delta_kernel` (avoids materializing fp32 intermediates)
 - `max_seqlen` avoids `.item()` GPU sync — always pass it
 - dkdv backward uses gap-skipping for clean key tiles
 - GQA: fwd/dQ use `pid_kv = pid_h // N_KV_GROUPS` for K/V access; dKdV parallelizes across Q heads then reduces
 - Block sizes and launch params are tuned per (cc_major, head_dim) via `_TUNED_CONFIGS` / `_get_kernel_config()`
-- Ampere (sm_8x) tuned: fwd BM=64/128 BN=32, dq BM=32 BN=64, dkdv BM=32 BN=32
+- Backward kernels use `scale` (1/sqrt(d)) for gradient scaling, not `sm_scale` (which includes log2(e))
+- Ampere (sm_8x) tuned: fwd BM=64/128 BN=32, dq BM=128/64 BN=32, dkdv BM=32 BN=32
 - Fallback for unknown GPUs: fwd BM=128 BN=64 W=8, bwd BM=64 BN=64 W=4
 
 ## Environment

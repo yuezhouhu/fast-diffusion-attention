@@ -184,25 +184,47 @@ Kernel block sizes and launch parameters are **manually tuned per compute capabi
 
 Ratio = ours / flash (lower is better).
 
-**MHA** (n_heads=16, head_dim=64):
+### Single-document
+
+**MHA** (n_heads=16, head_dim=64, 1 doc):
 
 | Seq length | Forward | Fwd+Bwd |
 |------------|---------|---------|
 | 1024 | **1.08x** | **1.16x** |
 | 2048 | **1.01x** | 1.25x |
 | 4096 | **1.04x** | 1.26x |
-| 8192 | **1.06x** | 1.59x |
+| 8192 | **1.06x** | 1.34x |
 
-**GQA** (n_q_heads=16, n_kv_heads=8, head_dim=128):
+**GQA** (n_q_heads=16, n_kv_heads=8, head_dim=128, 1 doc):
 
 | Seq length | Forward | Fwd+Bwd |
 |------------|---------|---------|
-| 1024 | **0.41x** | 1.27x |
-| 2048 | **0.92x** | 1.25x |
-| 4096 | **1.38x** | 1.62x |
-| 8192 | **1.14x** | 1.56x |
+| 1024 | **0.41x** | 1.24x |
+| 2048 | **0.92x** | 1.28x |
+| 4096 | **1.38x** | 1.32x |
+| 8192 | **1.14x** | 1.33x |
 
-Run `python benchmarks/bench_gqa.py` to reproduce.
+### Multi-document (~32k total tokens)
+
+**MHA** (n_heads=16, head_dim=64):
+
+| Doc length | #Docs | Forward | Fwd+Bwd |
+|------------|-------|---------|---------|
+| 1024 | 32 | **0.85x** | **1.19x** |
+| 2048 | 16 | **1.06x** | 1.27x |
+| 4096 | 8 | **1.09x** | 1.33x |
+| 8192 | 4 | **1.06x** | 1.34x |
+
+**GQA** (n_q_heads=16, n_kv_heads=8, head_dim=128):
+
+| Doc length | #Docs | Forward | Fwd+Bwd |
+|------------|-------|---------|---------|
+| 1024 | 32 | 1.35x | 1.24x |
+| 2048 | 16 | **1.19x** | 1.28x |
+| 4096 | 8 | **1.09x** | 1.32x |
+| 8192 | 4 | **1.02x** | 1.33x |
+
+Run `python benchmarks/bench_gqa.py` or `python benchmarks/bench_long.py` to reproduce.
 
 ## Kernel Tuning
 

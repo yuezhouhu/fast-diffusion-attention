@@ -46,13 +46,13 @@ _TUNED_CONFIGS = {
     # Ampere (sm_86: A6000 / RTX 3090; also used for sm_80: A100)
     (8, 64): {
         "fwd":  (64,  32, 4, 1),
-        "dq":   (32,  64, 4, 1),
+        "dq":   (128, 32, 4, 1),
         "dkdv": (32,  32, 2, 1),
     },
     (8, 128): {
         "fwd":  (128, 32, 4, 1),
-        "dq":   (32,  64, 4, 1),
-        "dkdv": (32,  32, 4, 3),
+        "dq":   (64,  32, 4, 1),
+        "dkdv": (32,  32, 4, 1),
     },
 }
 
@@ -252,7 +252,7 @@ def _diff_noisy_attn_fwd_kernel(
     )
     tl.store(O_block_ptr, acc.to(q.dtype), boundary_check=(0,))
 
-    lse = m_i / 1.44269504 + tl.log(l_i_safe)
+    lse = m_i + tl.log(l_i_safe) * 1.44269504  # store in log2 domain
     lse = tl.where(m_valid, lse, 0.0)
     L_base = L_buf + pid_h
     offs_l = (seq_start + offs_m) * n_heads
@@ -274,6 +274,7 @@ def _diff_noisy_attn_bwd_dkdv_kernel(
     stride_dkt, stride_dkh, stride_dkd,
     n_heads: tl.constexpr,
     sm_scale,
+    scale,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -322,10 +323,6 @@ def _diff_noisy_attn_bwd_dkdv_kernel(
     dO_ptr = dO + pid_h * stride_oh
 
     # Compute tight M-iteration bounds based on which query rows attend to keys in this N-tile.
-    # For key at position j (doc-relative):
-    #   prompt key (j<L0, block b): query rows [b*S, doc_len)
-    #   clean key (L0<=j<L0+L1, block b): query rows [L0+b*S, L0+L1) ∪ [L0+L1+(b+1)*S, doc_len)
-    #   noisy key (j>=L0+L1, block b): query rows [L0+L1+b*S, L0+L1+(b+1)*S)
     is_prompt_k = offs_n < L0
     is_clean_k = (offs_n >= L0) & (offs_n < L0 + L1)
     is_noisy_k = offs_n >= L0 + L1
@@ -386,17 +383,16 @@ def _diff_noisy_attn_bwd_dkdv_kernel(
                 block_shape=(BLOCK_M, BLOCK_D), order=(1, 0),
             )
             q = tl.load(Q_block_ptr, boundary_check=(0,))
-            q = (q * sm_scale).to(q.dtype)
 
             qk = tl.dot(q, tl.trans(k))
+            qk = qk * sm_scale
             qk = tl.where(mask, qk, -1.0e6)
 
             L_base = L_buf + pid_h
             offs_l = (seq_start + offs_m) * n_heads
             lse = tl.load(L_base + offs_l, mask=m_valid, other=0.0)
 
-            p = tl.exp(qk / 1.44269504 - lse[:, None])
-            p = tl.where(mask, p, 0.0)
+            p = tl.exp2(qk - lse[:, None])
 
             dO_block_ptr = tl.make_block_ptr(
                 base=dO_ptr, shape=(seq_end, BLOCK_D),
@@ -411,10 +407,12 @@ def _diff_noisy_attn_bwd_dkdv_kernel(
 
             dpT = tl.dot(do, tl.trans(v))
             ds = p * (dpT - Di[:, None])
-            ds = tl.where(mask, ds, 0.0)
             dk += tl.dot(tl.trans(ds.to(q.dtype)), q)
 
-    # Write partial dK/dV for this Q head (reduced across Q heads later)
+    # Apply scale for correct gradient magnitude (not sm_scale which includes log2(e))
+    dk = dk * scale
+
+    # Write partial dK/dV for this Q head (reduced across Q heads on host)
     dK_ptr = dK + pid_h * stride_dkh
     dV_ptr = dV + pid_h * stride_dkh
     dK_block_ptr = tl.make_block_ptr(
@@ -445,6 +443,7 @@ def _diff_noisy_attn_bwd_dq_kernel(
     stride_ot, stride_oh, stride_od,
     n_heads: tl.constexpr,
     sm_scale,
+    scale,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
@@ -528,12 +527,10 @@ def _diff_noisy_attn_bwd_dq_kernel(
         qk = tl.dot(q, tl.trans(k))
         qk = tl.where(mask, qk, -1.0e6)
 
-        p = tl.exp(qk / 1.44269504 - lse[:, None])
-        p = tl.where(mask, p, 0.0)
+        p = tl.exp2(qk - lse[:, None])
 
         dpT = tl.dot(do, tl.trans(v))
         ds = p * (dpT - Di[:, None])
-        ds = tl.where(mask, ds, 0.0)
         dq += tl.dot(ds.to(k.dtype), k)
 
     # --- Range2 loop ---
@@ -569,15 +566,13 @@ def _diff_noisy_attn_bwd_dq_kernel(
         qk = tl.dot(q, tl.trans(k))
         qk = tl.where(mask, qk, -1.0e6)
 
-        p = tl.exp(qk / 1.44269504 - lse[:, None])
-        p = tl.where(mask, p, 0.0)
+        p = tl.exp2(qk - lse[:, None])
 
         dpT = tl.dot(do, tl.trans(v))
         ds = p * (dpT - Di[:, None])
-        ds = tl.where(mask, ds, 0.0)
         dq += tl.dot(ds.to(k.dtype), k)
 
-    dq = dq * sm_scale
+    dq = dq * scale
 
     dQ_ptr = dQ + pid_h * stride_qh
     dQ_block_ptr = tl.make_block_ptr(
@@ -586,6 +581,25 @@ def _diff_noisy_attn_bwd_dq_kernel(
         block_shape=(BLOCK_M, BLOCK_D), order=(1, 0),
     )
     tl.store(dQ_block_ptr, dq.to(q.dtype), boundary_check=(0,))
+
+
+# ---------------------------------------------------------------------------
+# Backward helper — fused D_i = rowsum(dO * O) kernel
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _compute_delta_kernel(
+    O, dO, Delta,
+    BLOCK_D: tl.constexpr,
+):
+    """Compute D_i = sum_d(O[t,h,d] * dO[t,h,d]) for one (token, head) pair."""
+    pid = tl.program_id(0)
+    offs_d = tl.arange(0, BLOCK_D)
+    base = pid * BLOCK_D
+    o = tl.load(O + base + offs_d).to(tl.float32)
+    do_val = tl.load(dO + base + offs_d).to(tl.float32)
+    delta = tl.sum(o * do_val)
+    tl.store(Delta + pid, delta)
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +647,7 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
 
         ctx.save_for_backward(q, k, v, o, lse, cu_seqlens, L0_arr, L1_arr)
         ctx.sm_scale = sm_scale
+        ctx.scale = scale
         ctx.log2s = log2s
         ctx.n_heads = n_heads
         ctx.BLOCK_D = BLOCK_D
@@ -644,6 +659,7 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
     def backward(ctx, do):
         q, k, v, o, lse, cu_seqlens, L0_arr, L1_arr = ctx.saved_tensors
         sm_scale = ctx.sm_scale
+        scale = ctx.scale
         log2s = ctx.log2s
         n_heads = ctx.n_heads
         BLOCK_D = ctx.BLOCK_D
@@ -658,8 +674,13 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
         BLOCK_M_DQ, BLOCK_N_DQ, dq_num_warps, dq_num_stages = _get_kernel_config(BLOCK_D, "dq")
         BLOCK_M_DKDV, BLOCK_N_DKDV, dkdv_num_warps, dkdv_num_stages = _get_kernel_config(BLOCK_D, "dkdv")
 
-        # D_i = sum_d (dO_i * O_i)  — precomputed for the backward softmax trick.
-        D = (do.float() * o.float()).sum(dim=-1)
+        # D_i = sum_d (dO_i * O_i)  — fused kernel avoids fp32 intermediate tensors.
+        D = torch.empty(total_tokens, n_heads, dtype=torch.float32, device=q.device)
+        _compute_delta_kernel[(total_tokens * n_heads,)](
+            o, do, D,
+            BLOCK_D=BLOCK_D,
+            num_warps=max(1, BLOCK_D // 32),
+        )
 
         dq = torch.empty_like(q)
 
@@ -673,17 +694,17 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
             k.stride(0), k.stride(1), k.stride(2),
             v.stride(0), v.stride(1), v.stride(2),
             o.stride(0), o.stride(1), o.stride(2),
-            n_heads=n_heads, sm_scale=sm_scale,
+            n_heads=n_heads, sm_scale=sm_scale, scale=scale,
             BLOCK_M=BLOCK_M_DQ, BLOCK_N=BLOCK_N_DQ, BLOCK_D=BLOCK_D, LOG2S=log2s,
             N_KV_GROUPS=n_kv_groups,
             num_warps=dq_num_warps, num_stages=dq_num_stages,
         )
 
         # --- dK, dV kernel ---
-        # Each Q head writes its partial dK/dV independently; reduced after.
-        dk_buf = torch.zeros(total_tokens, n_heads, BLOCK_D,
+        # Each Q head writes partial dK/dV; reduced across Q heads after.
+        dk_buf = torch.empty(total_tokens, n_heads, BLOCK_D,
                              dtype=k.dtype, device=k.device)
-        dv_buf = torch.zeros(total_tokens, n_heads, BLOCK_D,
+        dv_buf = torch.empty(total_tokens, n_heads, BLOCK_D,
                              dtype=v.dtype, device=v.device)
         num_n_tiles = (max_doc_len + BLOCK_N_DKDV - 1) // BLOCK_N_DKDV
         grid_dkdv = (num_n_tiles, n_heads, batch_size)
@@ -695,7 +716,7 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
             v.stride(0), v.stride(1), v.stride(2),
             o.stride(0), o.stride(1), o.stride(2),
             dk_buf.stride(0), dk_buf.stride(1), dk_buf.stride(2),
-            n_heads=n_heads, sm_scale=sm_scale,
+            n_heads=n_heads, sm_scale=sm_scale, scale=scale,
             BLOCK_M=BLOCK_M_DKDV, BLOCK_N=BLOCK_N_DKDV, BLOCK_D=BLOCK_D, LOG2S=log2s,
             N_KV_GROUPS=n_kv_groups,
             num_warps=dkdv_num_warps, num_stages=dkdv_num_stages,
