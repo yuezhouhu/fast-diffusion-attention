@@ -39,36 +39,108 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
 _VALID_STAIRCASE_SIZES = (1, 2, 4, 8, 16, 32, 64)
 
 # ---------------------------------------------------------------------------
-# Tuned kernel configs: (cc_major, head_dim) -> kernel -> (BM, BN, warps, stages)
-# Fallback to _DEFAULT_CONFIGS for architectures without tuned values.
+# Tuned kernel configs: (cc_major, cc_minor, head_dim, n_q_heads, n_kv_heads) -> kernel -> (BM, BN, warps, stages)
+# Matching order: exact match on all 5 params -> match on (cc_major, cc_minor, head_dim) -> match on (cc_major, cc_minor) -> default
 # ---------------------------------------------------------------------------
 _TUNED_CONFIGS = {
-    # Ampere (sm_86: A6000 / RTX 3090; also used for sm_80: A100)
-    (8, 64): {
-        "fwd":  (64,  32, 4, 1),
-        "dq":   (128, 32, 4, 1),
-        "dkdv": (32,  32, 2, 1),
-    },
-    (8, 128): {
+    (8, 0, 128, 16, 8): {
         "fwd":  (128, 32, 4, 1),
-        "dq":   (64,  32, 4, 1),
-        "dkdv": (32,  32, 4, 1),
+        "dq":   (64, 64, 4, 1),
+        # "dkdv": (32, 32, 4, 1),
+    },
+    (8, 0, 128, 32, 8): {
+        "fwd":  (128, 32, 4, 1),
+        # "dq":   (64, 32, 4, 1),
+        # "dkdv": (32, 32, 4, 1),
+    },
+    (8, 0, 128, 32, 4): {
+        "fwd":  (128, 32, 4, 1),
+        # "dq":   (64, 32, 4, 1),
+        # "dkdv": (32, 32, 4, 1),
+    },
+
+    (8, 6, 128, 16, 8): {
+        "fwd":  (128, 32, 4, 1),
+        "dq":   (64, 32, 4, 1),
+        "dkdv": (32, 32, 4, 1),
+    },
+    (8, 6, 128, 32, 8): {
+        "fwd":  (128, 32, 4, 1),
+        "dq":   (64, 32, 4, 1),
+        "dkdv": (32, 32, 4, 1),
+    },
+    (8, 6, 128, 32, 4): {
+        "fwd":  (128, 32, 4, 1),
+        "dq":   (64, 32, 4, 1),
+        "dkdv": (32, 32, 4, 1),
+    },
+
+    (8, 9, 128, 16, 8): {
+        "fwd":  (128, 32, 4, 2),
+        "dq":   (128, 32, 8, 1),
+        "dkdv": (64, 64, 8, 3),
+    },
+    (8, 9, 128, 32, 8): {
+        "fwd":  (128, 32, 4, 2),
+        "dq":   (128, 32, 8, 1),
+        "dkdv": (64, 64, 8, 3),
+    },
+    (8, 9, 128, 32, 4): {
+        "fwd":  (128, 32, 4, 2),
+        "dq":   (128, 32, 8, 1),
+        "dkdv": (64, 64, 8, 2),
+    },
+
+    (9, 0, 128, 16, 8): {
+        "fwd":  (128, 128, 8, 2),
+        "dq":   (128, 128, 8, 2),
+        "dkdv": (64, 64, 4, 1),
+    },
+    (9, 0, 128, 32, 8): {
+        "fwd":  (128, 128, 8, 2),
+        "dq":   (128, 128, 8, 2),
+        "dkdv": (64, 64, 4, 3),
+    },
+    (9, 0, 128, 32, 4): {
+        "fwd":  (128, 128, 8, 2),
+        "dq":   (128, 128, 8, 2),
+        "dkdv": (64, 64, 4, 1),
     },
 }
 
-def _get_kernel_config(head_dim: int, kernel: str):
-    """Return (BLOCK_M, BLOCK_N, num_warps, num_stages) for *kernel*."""
-    cc_major = torch.cuda.get_device_capability()[0]
-    key = (cc_major, head_dim)
+# Fallback configs for architectures without tuned values
+_DEFAULT_CONFIGS = {
+    "fwd":  (128, 32, 4, 1),
+    "dq":   (64, 32, 4, 1),
+    "dkdv": (32, 32, 4, 1),
+}
+
+
+def _get_kernel_config(head_dim: int, n_q_heads: int, n_kv_heads: int, kernel: str):
+    """Return (BLOCK_M, BLOCK_N, num_warps, num_stages) for *kernel*.
+    
+    Matching order:
+    1. Exact match on (cc_major, cc_minor, head_dim, n_q_heads, n_kv_heads)
+    2. Match on (cc_major, cc_minor, head_dim) with any nh/nkv
+    3. Match on (cc_major, cc_minor) with any head_dim/nh/nkv
+    4. Fallback to default config
+    """
+    import warnings
+    
+    cc_major, cc_minor = torch.cuda.get_device_capability()
+    
+    # Try exact match on all 5 params
+    key = (cc_major, cc_minor, head_dim, n_q_heads, n_kv_heads)
     if key in _TUNED_CONFIGS and kernel in _TUNED_CONFIGS[key]:
         return _TUNED_CONFIGS[key][kernel]
-    # Generic fallback — conservative settings that work on all GPUs.
-    if kernel == "fwd":
-        ns = 3 if head_dim <= 64 else 2 if head_dim <= 128 else 1
-        return (128, 64, 8, ns)
-    else:
-        ns = 3 if head_dim <= 64 else 2 if head_dim <= 128 else 1
-        return (64, 64, 4, ns)
+
+    # Fallback to default
+    warnings.warn(
+        f"No tuned config for ({cc_major}.{cc_minor}, d={head_dim}, "
+        f"nh={n_q_heads}, nkv={n_kv_heads}, kernel={kernel}). "
+        f"Using default config: {_DEFAULT_CONFIGS[kernel]}. Consider running tuning."
+    )
+    return _DEFAULT_CONFIGS[kernel]
 
 
 # ---------------------------------------------------------------------------
@@ -624,7 +696,9 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
 
         batch_size = cu_seqlens.numel() - 1
         BLOCK_D = head_dim
-        BLOCK_M, BLOCK_N, fwd_num_warps, fwd_num_stages = _get_kernel_config(head_dim, "fwd")
+        BLOCK_M, BLOCK_N, fwd_num_warps, fwd_num_stages = _get_kernel_config(
+            head_dim, n_heads, n_kv_heads, "fwd"
+        )
 
         # LSE is always stored in float32 for numerical stability.
         lse = torch.empty(total_tokens, n_heads, dtype=torch.float32, device=q.device)
@@ -671,8 +745,12 @@ class _DiffAttnNoisyFunction(torch.autograd.Function):
         batch_size = cu_seqlens.numel() - 1
         max_doc_len = ctx.max_seqlen
 
-        BLOCK_M_DQ, BLOCK_N_DQ, dq_num_warps, dq_num_stages = _get_kernel_config(BLOCK_D, "dq")
-        BLOCK_M_DKDV, BLOCK_N_DKDV, dkdv_num_warps, dkdv_num_stages = _get_kernel_config(BLOCK_D, "dkdv")
+        BLOCK_M_DQ, BLOCK_N_DQ, dq_num_warps, dq_num_stages = _get_kernel_config(
+            BLOCK_D, n_heads, n_kv_heads, "dq"
+        )
+        BLOCK_M_DKDV, BLOCK_N_DKDV, dkdv_num_warps, dkdv_num_stages = _get_kernel_config(
+            BLOCK_D, n_heads, n_kv_heads, "dkdv"
+        )
 
         # D_i = sum_d (dO_i * O_i)  — fused kernel avoids fp32 intermediate tensors.
         D = torch.empty(total_tokens, n_heads, dtype=torch.float32, device=q.device)

@@ -142,7 +142,11 @@ def main():
         for S in [1, 2, 3]
     ]
 
-    for head_dim, nh, nkv, desc in [(64, 16, 16, "MHA d=64"), (128, 16, 8, "GQA 2x d=128")]:
+    for head_dim, nh, nkv, desc in [
+        (128, 16, 8, "GQA 2x d=128"),
+        (128, 32, 8, "GQA 4x d=128"),
+        (128, 32, 4, "GQA 8x d=128"),
+    ]:
         print(f"\n{'='*70}")
         print(f"{desc}: Tuning dQ kernel")
         print(f"{'='*70}")
