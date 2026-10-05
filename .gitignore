@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+
+# Benchmark outputs
+benchmark_results*.json
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
