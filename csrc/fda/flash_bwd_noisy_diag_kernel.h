@@ -136,10 +136,12 @@ public:
     };
     static_assert(sizeof(ElementAccum) * kBlockM * kHeadDim <= 2 * sizeof(Element) * cute::cosize_v<SmemLayoutQdO>);
 
-    // dQ in smem: row-major with the columns XOR-swizzled by the row, so that the 8 rows of an MMA fragment hit
-    // different banks
+    // dQ in smem: row-major with the columns XOR-swizzled by the row, so that 4 consecutive rows of an MMA fragment
+    // (8 consecutive floats each) cover the 32 banks. The XOR only changes bits 3-4 of the column: the swizzled
+    // column stays in the same 32-column chunk, hence in the row (kHeadDim is a multiple of 32).
+    static_assert(kHeadDim % 32 == 0);
     CUTLASS_DEVICE static int sdq_index(int const row, int const col) {
-        return row * kHeadDim + (col ^ ((row & 7) << 3));
+        return row * kHeadDim + (col ^ ((row & 3) << 3));
     }
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
@@ -452,7 +454,10 @@ public:
                 #pragma unroll 1
                 for (int vt = thread_idx; vt < NumMmaThreadsMain; vt += NumMmaThreads) {
                     Tensor tdQcdQ_main = main_tiled_mma_dQ.get_thread_slice(vt).partition_C(cdQ_main);
-                    Tensor tdQrdQ_main = make_fragment_like<ElementAccum>(tdQcdQ_main);
+                    // Same fragment as the main kernel's dQ accumulator (make_fragment_like of the identity partition
+                    // does not compile when it has a mode of size 1)
+                    Tensor tdQrdQ_main = partition_fragment_C(main_tiled_mma_dQ, cdQ_main.shape());
+                    static_assert(CUTE_STATIC_V(size(tdQrdQ_main)) == CUTE_STATIC_V(size(tdQcdQ_main)));
                     #pragma unroll
                     for (int i = 0; i < size(tdQrdQ_main); ++i) {
                         int const row = get<!dQ_swapAB_main ? 0 : 1>(tdQcdQ_main(i));
