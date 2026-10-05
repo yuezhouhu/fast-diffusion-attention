@@ -79,6 +79,22 @@ struct CollectiveMainloopFwdSm90 {
         >{},
         AtomLayoutPV{}));
 
+    // Half-width diagonal tile of noisy query tiles: when the block size divides 64 and the tiles are 128 x 128, the 64
+    // rows of warpgroup w only see the keys [64 w, 64 w + 64) of the noisy key tile of the diagonal: every warpgroup
+    // computes a 64 x 64 tile (S and P V) instead of a 64 x 128 one. (Not for FP8: V is K-major in smem and its swizzle
+    // atom spans 128 keys.)
+    static constexpr bool HalfDiag = IntraWGOverlap && MmaPV_is_RS && !Is_FP8 && kBlockM == 128 && kBlockN == 128;
+    // Without HalfDiag, the "half" tiles are the full tiles (never used, but they need to be valid types)
+    static constexpr int kBlockNHalf = HalfDiag ? 64 : kBlockN;
+    using TileShape_MNK_Half = Shape<Int<kBlockM>, Int<kBlockNHalf>, Int<kHeadDim>>;
+    using TileShape_MNK_PV_Half = Shape<Int<kBlockM>, Int<kHeadDimV>, Int<kBlockNHalf>>;
+    using TiledMmaQKHalf = decltype(cute::make_tiled_mma(
+        cute::GMMA::ss_op_selector<Element, Element, ElementAccum, TileShape_MNK_Half>(),
+        AtomLayoutQK{}));
+    using TiledMmaPVHalf = decltype(cute::make_tiled_mma(
+        cute::GMMA::rs_op_selector<Element, Element, ElementAccum, TileShape_MNK_PV_Half, GMMA::Major::K, MmaMajorV>(),
+        AtomLayoutPV{}));
+
     static constexpr int NumMmaThreadsQK = size(TiledMmaQK{});
     static constexpr int NumMmaThreads = size(TiledMmaPV{});
     static constexpr int NumProducerThreads = !Transpose_V ? cutlass::NumThreadsPerWarp : cutlass::NumThreadsPerWarpGroup;
@@ -679,30 +695,67 @@ struct CollectiveMainloopFwdSm90 {
         barrier_Q.wait(work_idx % 2);
 
         if constexpr (IntraWGOverlap) {
-            Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
-            consumer_wait(pipeline_k, smem_pipe_read);
-            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
-            warpgroup_wait<0>();
-            pipeline_k.consumer_release(smem_pipe_read);
-            scoremod_premask_fn(tSrS);
-            mask_fn(tSrS, v);
+            // Noisy query tile whose diagonal key tile can be computed with half-width tiles (see HalfDiag)
+            bool const half_diag = HalfDiag && q_noisy && 64 % geom.bs() == 0;
+            Tensor tSrS_proto = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
+            Tensor tOrP = make_tensor<Element>(flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS_proto.layout()));
+            typename Softmax::TensorT scores_scale;
 
-            Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
-            softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
-            if constexpr (Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
-            Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
-            Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
-            convert_type_out(tOrP_acc, tOrP);
-            if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
-            if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
+            // Half-width tiles: Q rows of this warpgroup against keys [64 w, 64 w + 64) of the diagonal key tile
+            TiledMmaQKHalf tiled_mma_qk_half;
+            TiledMmaPVHalf tiled_mma_pv_half;
+            auto wg_mma_qk_half = tiled_mma_qk_half.get_slice(warp_group_thread_layout(warp_group_idx));
+            auto wg_mma_pv_half = tiled_mma_pv_half.get_slice(warp_group_thread_layout(warp_group_idx));
+            int const wg_half = HalfDiag ? warp_group_idx : 0;
+            Tensor sK_half = local_tile(sK, Shape<Int<kBlockNHalf>, Int<kHeadDim>, Int<kStages>>{}, make_coord(wg_half, _0{}, _0{}));
+            Tensor sV_half = local_tile(sV, Shape<Int<kHeadDimV>, Int<kBlockNHalf>, Int<kStages>>{}, make_coord(_0{}, wg_half, _0{}));
+            Tensor tSrQ_half = wg_mma_qk_half.partition_fragment_A(sQ);
+            Tensor tSrK_half = wg_mma_qk_half.partition_fragment_B(sK_half);
+            Tensor tOrV_half = wg_mma_pv_half.partition_fragment_B(sV_half);
+            Tensor tSrS_half_proto = partition_fragment_C(tiled_mma_qk_half, select<0, 1>(TileShape_MNK_Half{}));
+            Tensor tOrP_half = make_tensor<Element>(flash::convert_layout_acc_Aregs<TiledMmaPVHalf>(tSrS_half_proto.layout()));
+            flash::DiffusionMask<kBlockM, kBlockNHalf, TiledMmaQKHalf> mask_half(thread_idx, geom);
+
+            consumer_wait(pipeline_k, smem_pipe_read);
+            if (!half_diag) {
+                Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
+                flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
+                warpgroup_wait<0>();
+                pipeline_k.consumer_release(smem_pipe_read);
+                scoremod_premask_fn(tSrS);
+                mask_fn(tSrS, v);
+                cute::copy(softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS), scores_scale);
+                softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
+                if constexpr (Is_FP8) { flash::permute_Cregs_fp8(tSrS); }
+                Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
+                convert_type_out(tOrP_acc, tOrP);
+                if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
+                if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
+            } else {
+                if constexpr (HalfDiag) {
+                    Tensor tSrS = partition_fragment_C(tiled_mma_qk_half, select<0, 1>(TileShape_MNK_Half{}));
+                    flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk_half, tSrQ_half, tSrK_half(_, _, _, smem_pipe_read.index()), tSrS);
+                    warpgroup_wait<0>();
+                    pipeline_k.consumer_release(smem_pipe_read);
+                    scoremod_premask_fn(tSrS);
+                    // Keys [64 w, 64 w + 64) of the noisy key tile tiles.tile_idx(v), i.e. half tile 2 * tile + w
+                    mask_half.apply(tSrS, true /*q_noisy*/, m_block, true /*k_noisy*/, 2 * tiles.tile_idx(v) + warp_group_idx);
+                    cute::copy(softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS), scores_scale);
+                    softmax.template online_softmax</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
+                    Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPVHalf>(tSrS.layout()));
+                    convert_type_out(tOrP_acc, tOrP_half);
+                }
+            }
             --v;
 
             // Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
             clear(tOrO);
 
             // Each step does gemm0 for iter v, gemm1 for iter v + 1, and softmax for iter v.
-            auto fwd_step = [&](int const v, auto mask_fn, auto check_inf_type) {
+            // HalfPV: the P V gemm of iter v + 1 is the one of a half-width diagonal tile.
+            auto fwd_step = [&](int const v, auto mask_fn, auto check_inf_type, auto half_pv_type) {
                 static constexpr bool Check_inf = decltype(check_inf_type)::value;
+                static constexpr bool HalfPV = decltype(half_pv_type)::value;
                 PipelineState smem_pipe_read_v(smem_pipe_read.index(), smem_pipe_read.phase(), smem_pipe_read.count());
                 ++smem_pipe_read;
                 Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
@@ -711,7 +764,11 @@ struct CollectiveMainloopFwdSm90 {
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
                 if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
                 if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+                if constexpr (!HalfPV) {
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read_v.index()), tOrO);
+                } else {
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv_half, tOrP_half, tOrV_half(_, _, _, smem_pipe_read_v.index()), tOrO);
+                }
                 warp_scheduler_barrier_arrive();
                 warpgroup_wait<1>();
                 pipeline_k.consumer_release(smem_pipe_read);  // release K
@@ -728,22 +785,36 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
             };
 
+            if constexpr (HalfDiag) {
+                // The step after a half-width diagonal tile does its (half-width) P V gemm
+                if (half_diag && v >= 0) {
+                    fwd_step(v, mask_fn, cute::true_type{} /*check_inf*/, cute::true_type{} /*half_pv*/);
+                    --v;
+                }
+            }
             // Key tiles crossing an interval boundary: masking
             #pragma unroll 1
             for (; v >= tiles.n_block_mask_min; --v) {
-                fwd_step(v, mask_fn, cute::true_type{} /*check_inf*/);
+                fwd_step(v, mask_fn, cute::true_type{} /*check_inf*/, cute::false_type{} /*half_pv*/);
             }
             // Key tiles fully visible
             auto no_mask_fn = [](auto& tSrS, int v) { };
             #pragma unroll 1
             for (; v >= 0; --v) {
-                fwd_step(v, no_mask_fn, cute::false_type{} /*check_inf*/);
+                fwd_step(v, no_mask_fn, cute::false_type{} /*check_inf*/, cute::false_type{} /*half_pv*/);
             }
             // Tell producers that smem_q is ready
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
             if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
             consumer_wait(pipeline_v, smem_pipe_read);
-            flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+            if (!HalfDiag || !half_diag || n_block_max > 1) {
+                flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
+            } else {
+                // A single (half-width diagonal) key tile
+                if constexpr (HalfDiag) {
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv_half, tOrP_half, tOrV_half(_, _, _, smem_pipe_read.index()), tOrO);
+                }
+            }
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             cute::copy(softmax.finalize(v_descale), scores_scale);
             warpgroup_wait<0>();
