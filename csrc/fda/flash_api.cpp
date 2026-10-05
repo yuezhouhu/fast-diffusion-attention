@@ -500,6 +500,9 @@ mha_bwd(at::Tensor dout,  // (b, 2n, h, d) or (total, h, d)
         softmax_scale = softmax_scale_.value();
     }
     int const head_size_rounded = round_up_headdim(head_size);
+    // As in FlashAttention-3, the head dimension 256 kernels have no deterministic variant
+    TORCH_CHECK(!deterministic || head_size_rounded <= 192,
+                "fast-diffusion-attention: deterministic backward is only supported for head dimensions <= 192");
     // Very important that these match the kernel configs
     int const kBlockM_sm90 = head_size_rounded <= 64 ? (softcap > 0.0 ? 96 : 128)
         : (head_size_rounded <= 96 ? 64
