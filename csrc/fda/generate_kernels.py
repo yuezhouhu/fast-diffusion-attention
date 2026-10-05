@@ -28,6 +28,12 @@ def file_name(direction, hdim, dtype, softcap):
     return f"flash_{direction}_hdim{hdim}_{dtype}{softcap}_sm90.cu"
 
 
+def write_if_changed(path, src):
+    # Keep the modification time of unchanged files, so that incremental builds do not recompile them
+    if not path.exists() or path.read_text() != src:
+        path.write_text(src)
+
+
 def main():
     out_dir = Path(__file__).resolve().parent / "instantiations"
     out_dir.mkdir(exist_ok=True)
@@ -38,7 +44,7 @@ def main():
                        f"#if {guard(hdim, dtype, softcap)}\n"
                        f"template void run_mha_fwd_<90, {ctype}, {hdim}, {flag}>(Flash_fwd_params &params, cudaStream_t stream);\n"
                        "#endif\n")
-                (out_dir / file_name("fwd", hdim, dtype, softcap)).write_text(src)
+                write_if_changed(out_dir / file_name("fwd", hdim, dtype, softcap), src)
         for dtype, ctype in DTYPES_BWD.items():
             for softcap, flag in SOFTCAPS.items():
                 src = (HEADER + '#include "flash_bwd_launch_template.h"\n\n'
@@ -46,7 +52,7 @@ def main():
                        f"template<>\nvoid run_mha_bwd_<90, {ctype}, {hdim}, {flag}>(Flash_bwd_params &params, cudaStream_t stream) {{\n"
                        f"    run_mha_bwd_hdim{hdim}<90, {ctype}, {flag}>(params, stream);\n"
                        "}\n#endif\n")
-                (out_dir / file_name("bwd", hdim, dtype, softcap)).write_text(src)
+                write_if_changed(out_dir / file_name("bwd", hdim, dtype, softcap), src)
 
 
 if __name__ == "__main__":

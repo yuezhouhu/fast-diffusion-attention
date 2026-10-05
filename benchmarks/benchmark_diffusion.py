@@ -74,6 +74,9 @@ def main():
     parser.add_argument("--headdim", type=int, default=128)
     parser.add_argument("--dtype", default="bf16", choices=["bf16", "fp16", "fp8"])
     parser.add_argument("--varlen", action="store_true", help="use the varlen interface (packed samples)")
+    parser.add_argument("--mixed", action="store_true",
+                        help="varlen with samples of random lengths L_i in [L / 8, L] (SFT-like packing) packed into "
+                             "batch-tokens tokens, instead of samples of length L")
     parser.add_argument("--no-bwd", action="store_true")
     parser.add_argument("--rounds", type=int, default=5, help="interleaved measurement rounds (median reported)")
     args = parser.parse_args()
@@ -82,10 +85,17 @@ def main():
     H, Hk, D = args.heads, args.kv_heads, args.headdim
     print(f"nheads {H}/{Hk}, headdim {D}, {args.dtype}{', varlen' if args.varlen else ''}; "
           f"time in ms (TFLOPS on visible (q, k) pairs)")
+    assert not args.mixed or args.varlen, "--mixed requires --varlen"
     for L in args.seqlens:
         assert L % 2 == 0
         n = L // 2
         B = max(1, args.batch_tokens // L)
+        if args.mixed:
+            variants = mixed_varlen_variants(args, L, dtype, bwd)
+            fns = {name: make_fwd_bwd(f, *qkv, bwd) for name, (f, _, qkv) in variants.items()}
+            variants = {name: (f, pairs) for name, (f, pairs, _) in variants.items()}
+            report(args, f"L_i in [{L // 8}, {L}]", variants, fns, bwd)
+            continue
         q, k, v = [torch.randn(B, L, h, D, device="cuda", dtype=torch.bfloat16).to(dtype).requires_grad_(bwd)
                    for h in (H, Hk, Hk)]
         variants = {}
@@ -111,25 +121,58 @@ def main():
                                                       v.view(-1, *v.shape[2:]), cu, cu, L, L, bs)
             variants[f"diffusion bs={bs}"] = (f, B * num_visible_pairs(n, bs))
         fns = {name: make_fwd_bwd(f, q, k, v, bwd) for name, (f, _) in variants.items()}
-        times = {name: ([], []) for name in variants}
-        rng = random.Random(0)
-        for _ in range(args.rounds):
-            # Random order in every round: the clock of power-capped GPUs depends on the preceding work
-            order = list(fns.items())
-            rng.shuffle(order)
-            for name, (fwd, bwd_fn) in order:
-                times[name][0].append(cuda_time(fwd))
-                if bwd_fn is not None:
-                    times[name][1].append(cuda_time(bwd_fn))
-        print(f"L = {L}, batch {B}")
-        for name, (_, pairs) in variants.items():
-            flops = 4 * pairs * D * H
-            t_fwd = statistics.median(times[name][0])
-            s = f"  {name:20s} fwd {t_fwd:7.3f} ({flops / t_fwd * 1e-9:4.0f})"
-            if bwd:
-                t_bwd = statistics.median(times[name][1])
-                s += f"   bwd {t_bwd:7.3f} ({2.5 * flops / t_bwd * 1e-9:4.0f})"
-            print(s)
+        report(args, f"L = {L}, batch {B}", variants, fns, bwd)
+
+
+def mixed_varlen_variants(args, L, dtype, bwd):
+    """Samples of random even lengths in [L / 8, L], packed into batch_tokens tokens."""
+    H, Hk, D = args.heads, args.kv_heads, args.headdim
+    gen = random.Random(L)
+    ns = []
+    while 2 * (sum(ns) + L // 2) <= args.batch_tokens:
+        ns.append(gen.randint(L // 16, L // 2))
+    total = 2 * sum(ns)
+    cu = torch.tensor([0] + [2 * x for x in ns], device="cuda", dtype=torch.int32).cumsum(0, dtype=torch.int32)
+    q, k, v = [torch.randn(total, h, D, device="cuda", dtype=torch.bfloat16).to(dtype).requires_grad_(bwd)
+               for h in (H, Hk, Hk)]
+    variants = {}
+    if fa3 is not None:
+        # FA3 varlen causal attention on the halves: every sample is two sequences of length n_i
+        cu_halves = torch.tensor([0] + [x for x in ns for _ in range(2)], device="cuda",
+                                 dtype=torch.int32).cumsum(0, dtype=torch.int32)
+
+        def fa3_halves(q, k, v):
+            return fa3.flash_attn_varlen_func(q, k, v, cu_halves, cu_halves, max(ns), max(ns), causal=True)
+        variants["FA3 causal 2x(n)"] = (fa3_halves, sum(2 * (x * (x + 1) // 2) for x in ns), (q, k, v))
+    for bs in args.block_sizes:
+        def f(q, k, v, bs=bs):
+            return diffusion_attn_varlen_func(q, k, v, cu, cu, 2 * max(ns), 2 * max(ns), bs)
+        variants[f"diffusion bs={bs}"] = (f, sum(num_visible_pairs(x, bs) for x in ns), (q, k, v))
+    print(f"{len(ns)} samples, {total} tokens")
+    return variants
+
+
+def report(args, title, variants, fns, bwd):
+    D, H = args.headdim, args.heads
+    times = {name: ([], []) for name in variants}
+    rng = random.Random(0)
+    for _ in range(args.rounds):
+        # Random order in every round: the clock of power-capped GPUs depends on the preceding work
+        order = list(fns.items())
+        rng.shuffle(order)
+        for name, (fwd, bwd_fn) in order:
+            times[name][0].append(cuda_time(fwd))
+            if bwd_fn is not None:
+                times[name][1].append(cuda_time(bwd_fn))
+    print(title)
+    for name, (_, pairs) in variants.items():
+        flops = 4 * pairs * D * H
+        t_fwd = statistics.median(times[name][0])
+        s = f"  {name:20s} fwd {t_fwd:7.3f} ({flops / t_fwd * 1e-9:4.0f})"
+        if bwd:
+            t_bwd = statistics.median(times[name][1])
+            s += f"   bwd {t_bwd:7.3f} ({2.5 * flops / t_bwd * 1e-9:4.0f})"
+        print(s)
 
 
 if __name__ == "__main__":
