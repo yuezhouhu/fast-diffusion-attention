@@ -19,6 +19,11 @@ import torch
 from fast_diffusion_attention import diffusion_attn_func, diffusion_attn_varlen_func
 from fast_diffusion_attention.reference import attention_ref, attention_varlen_ref, diffusion_mask, num_visible_pairs
 
+try:
+    from flash_attn_3 import flash_attn_interface as fa3
+except ImportError:
+    fa3 = None
+
 DEVICE = "cuda"
 HDIMS_BUILT = [int(h) for h in os.getenv("FDA_TEST_HDIMS", "64,96,128,192,256").split(",")]
 DISABLE_FP16 = os.getenv("FDA_TEST_DISABLE_FP16", "0") == "1"
@@ -135,6 +140,8 @@ def test_diffusion_attn_headdims(block_size, d, dtype):
 @pytest.mark.parametrize("nheads, nheads_k", [(4, 4), (6, 2)])
 @pytest.mark.parametrize("block_size", [1, 4, 13, 64, 160])
 def test_diffusion_attn_varlen(block_size, nheads, nheads_k, deterministic, d, dtype):
+    if deterministic and d > 192:
+        pytest.skip("no deterministic backward for head dimension 256")
     torch.random.manual_seed(block_size)
     ns = [17, 300, 1, 128, 513, 64, 2, 255]
     seqlens = [2 * x for x in ns]
@@ -202,8 +209,9 @@ def test_deterministic(varlen, nheads, nheads_k, d):
 @pytest.mark.parametrize("varlen", [False, True])
 @pytest.mark.parametrize("batch, n, block_size", [(2, 300, 4), (1, 517, 32), (2, 64, 1), (1, 400, 160)])
 def test_diffusion_attn_fp8(batch, n, block_size, varlen, use_descale, nheads, nheads_k, d):
-    """FP8 (e4m3) forward. As in FlashAttention-3, P is quantized to FP8 inside the kernel, which dominates the
-    error: the error must be within 16x the error of a BF16 PyTorch implementation, and unbiased."""
+    """FP8 (e4m3) forward, tested as in FlashAttention-3: the error w.r.t. a float32 reference (on the same FP8
+    inputs) must be at most twice the error of a PyTorch implementation in BF16 that also quantizes P to FP8 (as the
+    kernel does), plus a few ulps. The errors must also be unbiased."""
     torch.random.manual_seed(n + d)
     qf, kf, vf = [torch.randn(batch, 2 * n, h, d, device=DEVICE) for h in (nheads, nheads_k, nheads_k)]
     if use_descale:
@@ -213,13 +221,6 @@ def test_diffusion_attn_fp8(batch, n, block_size, varlen, use_descale, nheads, n
     else:
         descales = [None] * 3
         q8, k8, v8 = [x.to(torch.float8_e4m3fn) for x in (qf, kf, vf)]
-    # Dequantized inputs, the reference is computed on them
-    deq = []
-    for x, s in zip((q8, k8, v8), descales):
-        xf = x.float()
-        if s is not None:
-            xf = xf * s.repeat_interleave(x.shape[2] // s.shape[1], dim=1)[:, None, :, None]
-        deq.append(xf)
     if not varlen:
         out, lse = diffusion_attn_func(q8, k8, v8, block_size, q_descale=descales[0], k_descale=descales[1],
                                        v_descale=descales[2], return_attn_probs=True)
@@ -231,13 +232,16 @@ def test_diffusion_attn_fp8(batch, n, block_size, varlen, use_descale, nheads, n
         out = out.reshape(batch, 2 * n, nheads, d)
         lse = lse.reshape(nheads, batch, 2 * n).permute(1, 0, 2)
     assert out.dtype == torch.bfloat16
-    out_ref, lse_ref = attention_ref(*deq, block_size)
-    out_pt, _ = attention_ref(*[x.to(torch.bfloat16) for x in deq], block_size, upcast=False)
-    err = (out.float() - out_ref.float()).abs().max().item()
-    err_pt = (out_pt.float() - out_ref.float()).abs().max().item()
-    assert err <= 16 * err_pt + 1e-3, f"FP8 max error {err} vs BF16 PyTorch {err_pt}"
-    # LSE is computed in FP32 from FP8 scores (no P quantization)
-    assert (lse - lse_ref).abs().max().item() < 1e-2
+    # The FP8 values are exactly representable in BF16
+    q16, k16, v16 = [x.to(torch.bfloat16) for x in (q8, k8, v8)]
+    descale_kw = dict(q_descale=descales[0], k_descale=descales[1], v_descale=descales[2])
+    out_ref, lse_ref = attention_ref(q16, k16, v16, block_size, **descale_kw)
+    out_pt, _ = attention_ref(q16, k16, v16, block_size, **descale_kw, upcast=False, reorder_ops=True,
+                              intermediate_dtype=torch.float8_e4m3fn)
+    _errors_ok("out", out, out_ref, out_pt)
+    # LSE is computed in FP32 from the FP8 scores, but the FP8 tensor cores accumulate QK^T with reduced precision:
+    # errors up to ~1e-3, identical to those of FlashAttention-3 (see test_accuracy_matches_fa3)
+    assert (lse - lse_ref).abs().max().item() < 5e-3
     # Unbiased: the mean error is small compared to the mean absolute error
     diff = (out.float() - out_ref.float())
     assert diff.mean().abs().item() <= 0.1 * diff.abs().mean().item() + 1e-5
@@ -334,3 +338,49 @@ def test_errors():
         diffusion_attn_func(q, q, q, 0)
     with pytest.raises(RuntimeError):
         diffusion_attn_func(q.float(), q.float(), q.float(), 4)
+
+
+@pytest.mark.skipif(256 not in HDIMS_BUILT, reason="head dimension 256 kernels not built")
+def test_deterministic_hdim256_unsupported():
+    q = torch.randn(1, 64, 2, 256, device=DEVICE, dtype=torch.bfloat16, requires_grad=True)
+    out = diffusion_attn_func(q, q, q, 4, deterministic=True)
+    with pytest.raises(RuntimeError, match="deterministic"):
+        out.sum().backward()
+
+
+@pytest.mark.skipif(fa3 is None, reason="FlashAttention-3 (flash_attn_3) not installed")
+@pytest.mark.parametrize("dtype", DTYPES + ([] if DISABLE_FP8 else [torch.float8_e4m3fn]))
+@pytest.mark.parametrize("d", hdims(64, 96, 128, 192, 256))
+def test_accuracy_matches_fa3(d, dtype):
+    """With block_size = 1, the clean half is causal attention on the clean tokens, and with a zero output gradient
+    on the noisy half, the gradients of the clean half are those of that causal attention. On this subproblem, the
+    errors w.r.t. float32 of the output, the LSE and dQ / dK / dV must match those of FlashAttention-3 (mean error at
+    most 10% larger, max error at most 50% larger plus a few ulps)."""
+    torch.random.manual_seed(d)
+    batch, n, nheads, nheads_k = 2, 777, 6, 2
+    fp8 = dtype == torch.float8_e4m3fn
+    q, k, v = [torch.randn(batch, 2 * n, h, d, device=DEVICE).to(dtype).requires_grad_(not fp8)
+               for h in (nheads, nheads_k, nheads_k)]
+    out, lse = diffusion_attn_func(q, k, v, 1, return_attn_probs=True)
+    qc, kc, vc = [x[:, n:].detach().clone().requires_grad_(not fp8) for x in (q, k, v)]
+    out_fa3, lse_fa3 = fa3.flash_attn_func(qc, kc, vc, causal=True, return_attn_probs=True)
+    q16, k16, v16 = [x.detach().to(torch.bfloat16 if fp8 else dtype).requires_grad_(not fp8) for x in (q, k, v)]
+    out_ref, lse_ref = attention_ref(q16, k16, v16, 1)
+    results = {"out": (out[:, n:], out_fa3, out_ref[:, n:]), "lse": (lse[:, :, n:], lse_fa3, lse_ref[:, :, n:])}
+    if not fp8:
+        g = torch.randn_like(out)
+        g[:, :n] = 0
+        grads = torch.autograd.grad(out, (q, k, v), g)
+        grads_fa3 = torch.autograd.grad(out_fa3, (qc, kc, vc), g[:, n:])
+        grads_ref = torch.autograd.grad(out_ref, (q16, k16, v16), g)
+        for name, x, y, r in zip(("dq", "dk", "dv"), grads, grads_fa3, grads_ref):
+            # dS = P (dP - dPsum) = 0 on the noisy queries, the only ones that see the noisy keys
+            assert torch.all(x[:, :n] == 0), f"{name} of the noisy half is not zero"
+            results[name] = (x[:, n:], y, r[:, n:])
+    for name, (x, y, r) in results.items():
+        x, y, r = x.float(), y.float(), r.float()
+        atol = 2 * (r + 0.3 - 0.3 - r).abs().max().item() + 1e-6
+        err_mean, err_mean_fa3 = (x - r).abs().mean().item(), (y - r).abs().mean().item()
+        err_max, err_max_fa3 = (x - r).abs().max().item(), (y - r).abs().max().item()
+        assert err_mean <= 1.1 * err_mean_fa3 + 1e-7, f"{name}: mean error {err_mean} vs FA3 {err_mean_fa3}"
+        assert err_max <= 1.5 * err_max_fa3 + atol, f"{name}: max error {err_max} vs FA3 {err_max_fa3}"
