@@ -122,6 +122,7 @@ public:
         float const softmax_scale;
         int const seqlen;  // length of a sample (2n) if not varlen
         int const* cu_seqlens = nullptr;
+        bool const skip_noisy = false;  // only convert the tiles of the clean half
     };
 
     // Kernel entry point API
@@ -135,6 +136,7 @@ public:
         float const softmax_scale;
         int const seqlen;  // length of a sample (2n) if not varlen
         int const* cu_seqlens = nullptr;
+        bool const skip_noisy = false;  // only convert the tiles of the clean half
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -150,7 +152,8 @@ public:
             args.stride_dQ,
             args.softmax_scale,
             args.seqlen,
-            args.cu_seqlens
+            args.cu_seqlens,
+            args.skip_noisy
         };
     }
 
@@ -171,6 +174,7 @@ public:
         int const half = blockIdx.x & 1;
         int const bidh = blockIdx.y;
         int const bidb = blockIdx.z;
+        if (params.skip_noisy && half == 0) { return; }
 
         flash::DiffusionSeqlenInfo<Varlen> seqlen_info(bidb, params.seqlen, params.cu_seqlens);
         bool const is_varlen = Varlen && params.cu_seqlens;

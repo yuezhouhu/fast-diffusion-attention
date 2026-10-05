@@ -15,6 +15,7 @@
 #include "flash.h"
 #include "flash_bwd_preprocess_kernel.h"
 #include "flash_bwd_postprocess_kernel.h"
+#include "flash_bwd_noisy_diag_kernel.h"
 #include "tile_scheduler.hpp"
 #include "mainloop_bwd_sm90_tma_gmma_ws.hpp"
 #include "epilogue_bwd.hpp"
@@ -37,6 +38,10 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     int const batch = !is_varlen ? params.b : 1;
     // Maximum length of a half of a sample
     int const n_max = (params.seqlen + 1) / 2;
+    // The noisy-noisy (block-diagonal) part is computed by FlashAttnBwdNoisyDiag if the block size divides 64 (the
+    // diagonal blocks are then contained in the query tiles), otherwise by the main kernel (noisy key tiles).
+    static constexpr bool NoisyDiagSupported = kBlockM == 64 || kBlockM == 128;
+    bool const noisy_diag_kernel = NoisyDiagSupported && 64 % params.block_size == 0;
 
     using TileShape_MK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
     using PreprocessKernel = flash::FlashAttnBwdPreprocess<TileShape_MK, Element, ElementAccum, ArchTag, /*Clear_dQaccum=*/true, Varlen>;
@@ -57,7 +62,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         {params.total_q_padded * params.d_rounded, params.h},  // shape_dQaccum
         {_1{}, params.total_q_padded * params.d_rounded},  // stride_dQaccum
         params.seqlen,
-        params.cu_seqlens
+        params.cu_seqlens,
+        noisy_diag_kernel /*skip_dqaccum_noisy*/
     };
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = 2 * cute::ceil_div(n_max, kBlockM);
@@ -100,7 +106,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         params.softcap,
         params.block_size,
         params.dq_semaphore,
-        params.cu_seqlens
+        params.cu_seqlens,
+        !noisy_diag_kernel /*noisy_key_tiles*/
     };
     // The case work with GQA is ugly but idk how to fix it.
     typename CollectiveEpilogue::Arguments epilogue_args = [&] {
@@ -132,16 +139,63 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         }
     }();
 
-    // Key tiles of the clean half, then of the noisy half
+    if constexpr (NoisyDiagSupported) {
+        if (noisy_diag_kernel) {
+            using NoisyDiagKernel = flash::FlashAttnBwdNoisyDiag<kHeadDim, kBlockM, Element, Varlen, Has_softcap,
+                typename CollectiveMainloop::TiledMmadQ, CollectiveMainloop::NumMmaThreads, CollectiveMainloop::dQ_swapAB>;
+            typename NoisyDiagKernel::Arguments noisy_args {
+                static_cast<Element const*>(params.q_ptr),
+                {seqlen, params.d, params.h, batch},  // shape_Q
+                {params.q_row_stride, _1{}, params.q_head_stride, !is_varlen ? params.q_batch_stride : 0},  // stride_Q
+                static_cast<Element const*>(params.k_ptr),
+                {seqlen, params.d, params.h_k, batch},  // shape_K
+                {params.k_row_stride, _1{}, params.k_head_stride, !is_varlen ? params.k_batch_stride : 0},  // stride_K
+                static_cast<Element const*>(params.v_ptr),
+                {params.v_row_stride, _1{}, params.v_head_stride, !is_varlen ? params.v_batch_stride : 0},  // stride_V
+                static_cast<Element const*>(params.o_ptr),
+                {params.o_row_stride, _1{}, params.o_head_stride, !is_varlen ? params.o_batch_stride : 0},  // stride_O
+                static_cast<Element const*>(params.do_ptr),
+                {params.do_row_stride, _1{}, params.do_head_stride, !is_varlen ? params.do_batch_stride : 0},  // stride_dO
+                static_cast<Element*>(params.dk_ptr),
+                {params.dk_row_stride, _1{}, params.dk_head_stride, !is_varlen ? params.dk_batch_stride : 0},  // stride_dK
+                static_cast<Element*>(params.dv_ptr),
+                {params.dv_row_stride, _1{}, params.dv_head_stride, !is_varlen ? params.dv_batch_stride : 0},  // stride_dV
+                static_cast<float const*>(params.softmax_lse_ptr),
+                {_1{}, seqlen, !is_varlen ? params.h * seqlen : 0},  // stride_LSE
+                static_cast<float*>(params.softmax_lse_log2_ptr),
+                static_cast<float*>(params.dsoftmax_sum),
+                {params.total_q_padded, params.h},  // shape_dPsum
+                {_1{}, params.total_q_padded},  // stride_dPsum
+                static_cast<ElementAccum*>(params.dq_accum_ptr),
+                {params.total_q_padded * params.d_rounded, params.h},  // shape_dQaccum
+                {_1{}, params.total_q_padded * params.d_rounded},  // stride_dQaccum
+                params.scale_softmax,
+                params.softcap,
+                params.block_size,
+                params.seqlen,
+                params.cu_seqlens
+            };
+            typename NoisyDiagKernel::Params noisy_params = NoisyDiagKernel::to_underlying_arguments(noisy_args);
+            dim3 grid_noisy(cute::ceil_div(n_max, kBlockM), params.h_k, params.b);
+            int smem_size_noisy = NoisyDiagKernel::SharedStorageSize;
+            if (smem_size_noisy >= 48 * 1024) {
+                CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<NoisyDiagKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_noisy));
+            }
+            CHECK_CUTLASS(cutlass::kernel_launch<NoisyDiagKernel>(grid_noisy, NoisyDiagKernel::MaxThreadsPerBlock, smem_size_noisy, stream, noisy_params, false /*launch_with_pdl*/));
+        }
+    }
+
+    // Key tiles of the clean half, then of the noisy half (if not done by FlashAttnBwdNoisyDiag)
     int const num_blocks_half = cutlass::ceil_div(n_max, kBlockN);
+    int const num_blocks_noisy = noisy_diag_kernel ? 0 : num_blocks_half;
     typename flash::TileSchedulerArguments scheduler_args {
-        2 * num_blocks_half, params.h, params.b,
+        num_blocks_half + num_blocks_noisy, params.h, params.b,
         params.h / params.h_k,
         params.seqlen,
         params.d, sizeof(Element),
         params.tile_count_semaphore, params.cu_seqlens,
         nullptr, nullptr, nullptr,
-        num_blocks_half /*num_blocks_noisy*/,
+        num_blocks_noisy,
         Deterministic /*spt*/
     };
 
@@ -201,7 +255,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             {params.dk_row_stride, _1{}, params.dk_head_stride, params.dk_batch_stride},  // stride_dK
             1.f,
             params.seqlen,
-            params.cu_seqlens
+            params.cu_seqlens,
+            noisy_diag_kernel /*skip_noisy*/
         };
         typename PostprocessKerneldKV::Params postprocess_dK_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dK_args);
         typename PostprocessKerneldKV::Arguments postprocess_dV_args {
@@ -213,7 +268,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             {params.dv_row_stride, _1{}, params.dv_head_stride, params.dv_batch_stride},  // stride_dV
             1.f,
             params.seqlen,
-            params.cu_seqlens
+            params.cu_seqlens,
+            noisy_diag_kernel /*skip_noisy*/
         };
         typename PostprocessKerneldKV::Params postprocess_dV_params = PostprocessKerneldKV::to_underlying_arguments(postprocess_dV_args);
         dim3 grid_n_postprocess(2 * num_blocks_half, params.h_k, params.b);

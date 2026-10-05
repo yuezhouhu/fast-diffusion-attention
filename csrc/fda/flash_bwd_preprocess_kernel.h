@@ -90,6 +90,7 @@ public:
         StridedQaccum const stride_dQaccum;
         int const seqlen;  // length of a sample (2n) if not varlen
         int const* cu_seqlens = nullptr;
+        bool const skip_dqaccum_noisy = false;  // dQaccum of the noisy half is initialized by FlashAttnBwdNoisyDiag
     };
 
     // Kernel entry point API
@@ -193,7 +194,7 @@ public:
             gLSElog2(thread_idx) = lse == -INFINITY ? 0.f : lse * float(M_LOG2E);
         }
 
-        if constexpr (Clear_dQaccum) {
+        if (Clear_dQaccum && !(params.skip_dqaccum_noisy && half == 0)) {
             Tensor mdQaccum = make_tensor(make_gmem_ptr(params.ptr_dQaccum), params.shape_dQaccum, params.stride_dQaccum)(_, bidh);
             Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));
             GmemTiledCopyAccum gmem_tiled_copy_dQaccum;

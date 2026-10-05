@@ -314,6 +314,7 @@ struct CollectiveMainloopBwdSm90 {
         int const block_size;
         int* const dq_semaphore;
         int const* const cu_seqlens = nullptr;
+        bool const noisy_key_tiles = true;  // false: the noisy key tiles are processed by FlashAttnBwdNoisyDiag
     };
 
     // Device side kernel params
@@ -337,6 +338,7 @@ struct CollectiveMainloopBwdSm90 {
         cutlass::FastDivmod bs_divmod;
         int* const dq_semaphore;
         int const* const cu_seqlens = nullptr;
+        bool const noisy_key_tiles = true;
     };
 
     static Params
@@ -390,7 +392,8 @@ struct CollectiveMainloopBwdSm90 {
                 !Has_softcap ? 0.f : args.softmax_scale / args.softcap_val,
                 cutlass::FastDivmod(args.block_size),
                 args.dq_semaphore,
-                args.cu_seqlens};
+                args.cu_seqlens,
+                args.noisy_key_tiles};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -411,7 +414,7 @@ struct CollectiveMainloopBwdSm90 {
     // into the query tile m_block (of half q_noisy), in the order in which DiffusionBwdScheduler launches them
     // (SPT: noisy key tiles first in increasing order, then clean key tiles in decreasing order).
     CUTLASS_DEVICE
-    static int dq_rank(DiffusionGeometry const& g, bool const q_noisy, bool const k_noisy, int const n_block, int const m_block) {
+    static int dq_rank(DiffusionGeometry const& g, bool const noisy_key_tiles, bool const q_noisy, bool const k_noisy, int const n_block, int const m_block) {
         // Local copies: binding static constexpr members to the references of ceil_div would ODR-use them
         static constexpr int kBlockM = get<0>(TileShape_MNK{});
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
@@ -424,7 +427,7 @@ struct CollectiveMainloopBwdSm90 {
         } else {
             int const num_clean = cute::ceil_div(blk_last, kBlockN);
             int const noisy_lo = blk_first / kBlockN;
-            int const num_noisy = cute::ceil_div(cute::min(blk_last + g.bs(), g.n), kBlockN) - noisy_lo;
+            int const num_noisy = !noisy_key_tiles ? 0 : cute::ceil_div(cute::min(blk_last + g.bs(), g.n), kBlockN) - noisy_lo;
             return k_noisy ? n_block - noisy_lo : num_noisy + num_clean - 1 - n_block;
         }
     }
@@ -637,7 +640,7 @@ struct CollectiveMainloopBwdSm90 {
             int const tile_id = (q_noisy ? offset_padded_noisy : offset_padded_clean) / kBlockM + m_block;
             if constexpr (Deterministic) {
                 Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, tile_id * num_head,
-                                 dq_rank(geom, q_noisy, k_noisy, n_block, m_block));
+                                 dq_rank(geom, params.noisy_key_tiles, q_noisy, k_noisy, n_block, m_block));
             }
             #pragma unroll
             for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
