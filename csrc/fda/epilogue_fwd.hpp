@@ -20,8 +20,9 @@ namespace flash {
 
 using namespace cute;
 
-// Writes the output tile of one half of a sample. The rows of a tile beyond the end of the half belong to the
-// other half (or to the next sample), so the stores are predicated (no TMA store).
+// Writes the output tile of one half of a sample. Full tiles are written with a TMA store. The rows of the last tile
+// of a half beyond the end of the half belong to the other half (or to the next sample), so that tile is written with
+// predicated stores.
 template <class TileShape_MNK_PV_, class Element_, class ArchTag_,
           int NumEpilogueThreads_, bool Varlen_, bool FP8PermuteCol=false>
 struct CollectiveEpilogueFwd {
@@ -76,6 +77,14 @@ struct CollectiveEpilogueFwd {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutO>> smem_o;
     };
 
+    using GmemTiledCopyOTMA = cute::SM90_TMA_STORE;
+    using TMA_O = decltype(make_tma_copy(
+        GmemTiledCopyOTMA{},
+        make_tensor(make_gmem_ptr(static_cast<Element*>(nullptr)), ShapeO{}, StrideO{}),
+        SmemLayoutO{},
+        select<0, 1>(TileShape_MNK_PV{}),
+        _1{}));  // no mcast for O
+
     // Host side kernel arguments
     struct Arguments {
         Element* ptr_O;
@@ -94,19 +103,25 @@ struct CollectiveEpilogueFwd {
         float* ptr_LSE;
         ShapeLSE const shape_LSE;
         StrideLSE const stride_LSE;
+        TMA_O tma_store_O;
         int const* cu_seqlens = nullptr;
     };
 
     static Params
     to_underlying_arguments(Arguments const& args) {
+        Tensor mO = make_tensor(make_gmem_ptr(args.ptr_O), args.shape_O, args.stride_O);
+        TMA_O tma_store_O = make_tma_copy(GmemTiledCopyOTMA{}, mO, SmemLayoutO{}, select<0, 1>(TileShape_MNK_PV{}), _1{}); // no mcast
         return {args.ptr_O, args.shape_O, args.stride_O,
                 args.ptr_LSE, select<0, 2, 3>(args.shape_O), args.stride_LSE,
+                tma_store_O,
                 args.cu_seqlens};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
     CUTLASS_DEVICE
-    static void prefetch_tma_descriptors(Params const& params) { }
+    static void prefetch_tma_descriptors(Params const& params) {
+        cute::prefetch_tma_descriptor(params.tma_store_O.get_tma_descriptor());
+    }
 
     template <typename SharedStorage, typename FrgTensorO, typename FrgTensorLSE, typename TiledMma>
     CUTLASS_DEVICE void
@@ -140,11 +155,18 @@ struct CollectiveEpilogueFwd {
         Tensor taccOrO = smem_thr_copy_O.retile_S(tOrO_out);        // ((Atom,AtomNum), MMA_M, MMA_N)
         Tensor taccOsO = smem_thr_copy_O.partition_D(sO);     // ((Atom,AtomNum),PIPE_M,PIPE_N)
         cute::copy(smem_tiled_copy_O, taccOrO, taccOsO);
-        flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
         bool const is_varlen = Varlen && params.cu_seqlens;
         int const offset_o = seqlen_info.offset_half(half);
         int const seqlen_o = seqlen_info.n;
+        bool const full_tile = (m_block + 1) * kBlockM <= seqlen_o;
+        if (full_tile) {
+            cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible to TMA
+            cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
+                                                cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+        } else {
+            flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+        }
 
         // Step 2: Write LSE from rmem -> gmem
         auto thread_mma = tiled_mma.get_thread_slice(thread_idx);
@@ -165,25 +187,45 @@ struct CollectiveEpilogueFwd {
         }
 
         // Step 3: Write O from smem -> gmem
-        Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset_o * get<0>(params.stride_O)), params.shape_O, params.stride_O)(_, _, bidh, !is_varlen ? bidb : 0);
-        Tensor gO = local_tile(mO, select<0, 1>(TileShape_MNK_PV{}), make_coord(m_block, _0{}));  // (M, K)
-        GmemTiledCopyO gmem_tiled_copy_O;
-        auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
-        Tensor tOsO = gmem_thr_copy_O.partition_S(sO);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
-        Tensor tOrO_gmem = make_fragment_like(tOsO);
-        cute::copy(gmem_tiled_copy_O, tOsO, tOrO_gmem);
-        cutlass::arch::fence_view_async_shared(); // ensure smem reads are done before next TMA to smem_v
-        shared_storage.pipelines.barrier_O.arrive();
-        // (BLK_M,BLK_K) -> (blk_m,blk_k)
-        Tensor tOcO = gmem_thr_copy_O.partition_D(cute::make_identity_tensor(select<0, 1>(TileShape_MNK_PV{})));
-        Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOsO)));
-        #pragma unroll
-        for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(params.shape_O); }
-        Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
-        // Clear_OOB_K must be false since we don't want to write zeros to gmem
-        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
-            gmem_tiled_copy_O, tOrO_gmem, tOgO, tOcO, tOpO, seqlen_o - m_block * kBlockM
-        );
+        if (full_tile) {
+            Tensor mO = params.tma_store_O.get_tma_tensor(params.shape_O)(_, _, bidh, !is_varlen ? bidb : 0);
+            Tensor gO = local_tile(domain_offset(make_coord(offset_o, _0{}), mO), select<0, 1>(TileShape_MNK_PV{}), make_coord(m_block, _0{}));  // (M, K)
+            auto block_tma_O = params.tma_store_O.get_slice(_0{});
+            Tensor tOgO = block_tma_O.partition_D(gO);  // (TMA, TMA_M, TMA_K)
+            Tensor tOsO = block_tma_O.partition_S(sO); // (TMA, TMA_M, TMA_K)
+            int warp_idx_sync = __shfl_sync(0xffffffff, thread_idx / cutlass::NumThreadsPerWarp, 0);
+            if (warp_idx_sync == NumEpilogueThreads / cutlass::NumThreadsPerWarp - 1) {
+                cutlass::arch::NamedBarrier::sync(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
+                                                  cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                if (cute::elect_one_sync()) {
+                    cute::copy(params.tma_store_O, tOsO, tOgO);
+                    tma_store_arrive();
+                    tma_store_wait<0>();
+                    shared_storage.pipelines.barrier_O.arrive();
+                }
+            }
+        } else {
+            Tensor mO = make_tensor(make_gmem_ptr(params.ptr_O + offset_o * get<0>(params.stride_O)), params.shape_O, params.stride_O)(_, _, bidh, !is_varlen ? bidb : 0);
+            Tensor gO = local_tile(mO, select<0, 1>(TileShape_MNK_PV{}), make_coord(m_block, _0{}));  // (M, K)
+            GmemTiledCopyO gmem_tiled_copy_O;
+            auto gmem_thr_copy_O = gmem_tiled_copy_O.get_thread_slice(thread_idx);
+            Tensor tOsO = gmem_thr_copy_O.partition_S(sO);        // ((Atom,AtomNum),ATOM_M,ATOM_N)
+            Tensor tOrO_gmem = make_fragment_like(tOsO);
+            cute::copy(gmem_tiled_copy_O, tOsO, tOrO_gmem);
+            cutlass::arch::fence_view_async_shared(); // ensure smem reads are done before next TMA to smem_v
+            flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+            if (thread_idx == 0) { shared_storage.pipelines.barrier_O.arrive(); }
+            // (BLK_M,BLK_K) -> (blk_m,blk_k)
+            Tensor tOcO = gmem_thr_copy_O.partition_D(cute::make_identity_tensor(select<0, 1>(TileShape_MNK_PV{})));
+            Tensor tOpO = make_tensor<bool>(make_shape(size<2>(tOsO)));
+            #pragma unroll
+            for (int k = 0; k < size(tOpO); ++k) { tOpO(k) = get<1>(tOcO(_0{}, _0{}, k)) < get<1>(params.shape_O); }
+            Tensor tOgO = gmem_thr_copy_O.partition_D(gO);
+            // Clear_OOB_K must be false since we don't want to write zeros to gmem
+            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false, /*Clear_OOB_MN=*/false, /*Clear_OOB_K=*/false>(
+                gmem_tiled_copy_O, tOrO_gmem, tOgO, tOcO, tOpO, seqlen_o - m_block * kBlockM
+            );
+        }
     }
 
     CUTLASS_DEVICE void

@@ -192,7 +192,7 @@ public:
 
         if (warp_idx == 0 && lane_predicate) {
             shared_storage.pipelines.barrier_Q.init(1 /*numThreads*/);
-            shared_storage.pipelines.barrier_O.init(size(ClusterShape{}) * NumMmaThreads /*numThreads*/);
+            shared_storage.pipelines.barrier_O.init(size(ClusterShape{}) /*numThreads*/);  // One thread of the epilogue arrives
         }
 
         // We're counting on pipeline_k to call cutlass::arch::fence_barrier_init();

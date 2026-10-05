@@ -19,8 +19,9 @@ namespace flash {
 
 using namespace cute;
 
-// Writes dK and dV of a key tile of one half of a sample. The rows of a tile beyond the end of the half belong to
-// the other half (or to the next sample), so the stores are predicated (no TMA store).
+// Writes dK and dV of a key tile of one half of a sample. Full tiles are written with TMA stores. The rows of the
+// last tile of a half beyond the end of the half belong to the other half (or to the next sample), so that tile is
+// written with predicated stores.
 template <class TileShape_MNK_, class Element_, class ArchTag_,
           int NumEpilogueThreads_, bool Varlen_, bool dKV_swapAB_, int AtomLayoutKdKV=1>
 struct CollectiveEpilogueBwd {
@@ -47,12 +48,10 @@ struct CollectiveEpilogueBwd {
                         GmemLayoutAtom{},
                         Layout<Shape<_1, Int<kGmemElemsPerLoad>>>{}));  // Val layout, 8 or 16 vals per store
 
-    static constexpr int kBlockKSmem = kHeadDim % 64 == 0 ? 64 : (kHeadDim % 32 == 0 ? 32 : 16);
-    static constexpr int kSwizzle = kBlockKSmem == 64 ? 3 : (kBlockKSmem == 32 ? 2 : 1);
-    using SmemLayoutAtomdKV =
-        decltype(composition(Swizzle<kSwizzle, 3, 3>{},
-                             Layout<Shape<Int<8>, Int<kBlockKSmem>>,
-                             Stride<Int<kBlockKSmem>, _1>>{}));
+    using GmemTiledCopydKVTMA = cute::SM90_TMA_STORE;
+    // Smem layout suitable for TMA stores (and for the predicated stores of the last tile of a half)
+    using SmemLayoutAtomdKV = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
+                                       decltype(cute::get<1>(TileShape_MNK{})), Int<CUTE_STATIC_V(cute::get<2>(TileShape_MNK{})) / AtomLayoutKdKV>>());
     using SmemLayoutdKV = decltype(tile_to_shape(SmemLayoutAtomdKV{}, select<1, 2>(TileShape_MNK{})));
     using SmemLayoutdKVt =
         decltype(cute::composition(SmemLayoutdKV{},
@@ -74,6 +73,13 @@ struct CollectiveEpilogueBwd {
     using ShapedKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen_k, d, head, batch)
     using StridedKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
 
+    using TMA_dKV = decltype(make_tma_copy(
+        GmemTiledCopydKVTMA{},
+        make_tensor(make_gmem_ptr(static_cast<Element*>(nullptr)), ShapedKV{}, StridedKV{}),
+        SmemLayoutdKV{},
+        select<1, 2>(TileShape_MNK{}),
+        _1{}));  // no mcast for dKV
+
     // Host side kernel arguments
     struct Arguments {
         Element* ptr_dK;
@@ -94,17 +100,26 @@ struct CollectiveEpilogueBwd {
         StridedKV const stride_dK;
         Element* ptr_dV;
         StridedKV const stride_dV;
+        TMA_dKV tma_store_dK, tma_store_dV;
         int const* cu_seqlens = nullptr;
     };
 
     static Params
     to_underlying_arguments(Arguments const& args) {
-        return {args.ptr_dK, args.shape_dK, args.stride_dK, args.ptr_dV, args.stride_dV, args.cu_seqlens};
+        Tensor mdK = make_tensor(make_gmem_ptr(args.ptr_dK), args.shape_dK, args.stride_dK);
+        Tensor mdV = make_tensor(make_gmem_ptr(args.ptr_dV), args.shape_dK, args.stride_dV);
+        TMA_dKV tma_store_dK = make_tma_copy(GmemTiledCopydKVTMA{}, mdK, SmemLayoutdKV{}, select<1, 2>(TileShape_MNK{}), _1{}); // no mcast for dKV
+        TMA_dKV tma_store_dV = make_tma_copy(GmemTiledCopydKVTMA{}, mdV, SmemLayoutdKV{}, select<1, 2>(TileShape_MNK{}), _1{}); // no mcast for dKV
+        return {args.ptr_dK, args.shape_dK, args.stride_dK, args.ptr_dV, args.stride_dV,
+                tma_store_dK, tma_store_dV, args.cu_seqlens};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
     CUTLASS_DEVICE
-    static void prefetch_tma_descriptors(Params const& params) { }
+    static void prefetch_tma_descriptors(Params const& params) {
+        cute::prefetch_tma_descriptor(params.tma_store_dK.get_tma_descriptor());
+        cute::prefetch_tma_descriptor(params.tma_store_dV.get_tma_descriptor());
+    }
 
     template <typename SharedStorage, typename FrgTensorO, typename TiledMma>
     CUTLASS_DEVICE void
@@ -138,13 +153,41 @@ struct CollectiveEpilogueBwd {
         flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
         cute::copy(smem_tiled_copy_dKV, taccdVrdV, taccdVsdV);
         cute::copy(smem_tiled_copy_dKV, taccdKrdK, taccdKsdK);
-        flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
 
         static constexpr int kBlockN = get<1>(TileShape_MNK{});
         SeqlenInfo_t seqlen_info{bidb, size<0>(params.shape_dK), params.cu_seqlens};
         bool const is_varlen = Varlen && params.cu_seqlens;
         int const offset = seqlen_info.offset_half(k_half);
         int const seqlen = seqlen_info.n;
+        if ((n_block + 1) * kBlockN <= seqlen) {  // Full tile: TMA store
+            cutlass::arch::fence_view_async_shared(); // ensure smem writes are visible to TMA
+            cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
+                                                cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+            Tensor mdK = params.tma_store_dK.get_tma_tensor(params.shape_dK)(_, _, bidh, !is_varlen ? bidb : 0);
+            Tensor mdV = params.tma_store_dV.get_tma_tensor(params.shape_dK)(_, _, bidh, !is_varlen ? bidb : 0);
+            Tensor gdK = local_tile(domain_offset(make_coord(offset, _0{}), mdK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
+            Tensor gdV = local_tile(domain_offset(make_coord(offset, _0{}), mdV), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
+            auto block_tma_dK = params.tma_store_dK.get_slice(_0{});
+            auto block_tma_dV = params.tma_store_dV.get_slice(_0{});
+            Tensor tdKgdK = block_tma_dK.partition_D(gdK);  // (TMA, TMA_M, TMA_K)
+            Tensor tdKsdK = block_tma_dK.partition_S(sdK); // (TMA, TMA_M, TMA_K)
+            Tensor tdVgdV = block_tma_dV.partition_D(gdV);  // (TMA, TMA_M, TMA_K)
+            Tensor tdVsdV = block_tma_dV.partition_S(sdV); // (TMA, TMA_M, TMA_K)
+            int warp_idx_sync = __shfl_sync(0xffffffff, thread_idx / cutlass::NumThreadsPerWarp, 0);
+            if (warp_idx_sync == NumEpilogueThreads / cutlass::NumThreadsPerWarp - 1) {
+                cutlass::arch::NamedBarrier::sync(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
+                                                  cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+                if (cute::elect_one_sync()) {
+                    cute::copy(params.tma_store_dV, tdVsdV, tdVgdV);
+                    cute::copy(params.tma_store_dK, tdKsdK, tdKgdK);
+                    tma_store_arrive();
+                }
+            }
+            tma_store_wait<0>();
+            return;
+        }
+        flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+
         Tensor mdK = make_tensor(make_gmem_ptr(params.ptr_dK), params.shape_dK, params.stride_dK)(_, _, bidh, !is_varlen ? bidb : 0);
         Tensor gdK = local_tile(cute::domain_offset(make_coord(offset, _0{}), mdK), select<1, 2>(TileShape_MNK{}), make_coord(n_block, _0{}));  // (M, K)
         Tensor mdV = make_tensor(make_gmem_ptr(params.ptr_dV), params.shape_dK, params.stride_dV)(_, _, bidh, !is_varlen ? bidb : 0);
