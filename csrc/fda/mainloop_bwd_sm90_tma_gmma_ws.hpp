@@ -254,7 +254,9 @@ struct CollectiveMainloopBwdSm90 {
 
     // These are tuned for speed.
     // They don't affect correctness.
-    static constexpr bool SeparateMaskingIterations = true;
+    // Separate loops for the masked and the fully visible query tiles duplicate the code of a step, which costs
+    // registers (spills with hdim 128). With a single loop, the mask is applied under a (uniform) branch.
+    static constexpr bool SeparateMaskingIterations = false;
     // For hdim64, it's faster to shuffle the LSE and dPsum values among the 8 threads that share the same rows.
     static constexpr bool ShuffleLSE = SdP_swapAB && kHeadDim <= 64;
     static constexpr bool ShuffledPsum = SdP_swapAB && kHeadDim <= 64;
@@ -991,8 +993,12 @@ struct CollectiveMainloopBwdSm90 {
             CUTLASS_PRAGMA_NO_UNROLL
             for (; u < m_block_max; ++u) { bwd_step(u, no_mask_fn); }
         } else {
+            int const n_mask = tiles.n_mask();
+            auto mask_cond_fn = [&](auto& tSrS, bool const q_noisy, int const m_block) {
+                if (u < n_mask) { mask.apply(tSrS, q_noisy, m_block, k_noisy, n_block); }
+            };
             CUTLASS_PRAGMA_NO_UNROLL
-            for (; u < m_block_max; ++u) { bwd_step(u, mask_fn); }
+            for (; u < m_block_max; ++u) { bwd_step(u, mask_cond_fn); }
         }
 
         // if (blockIdx.x == 0 && threadIdx.x == 128) { print_tensor(tdVrdV); }
