@@ -22,9 +22,15 @@ Usage: python benchmarks/benchmark_diffusion.py [--seqlens 2048 4096 8192 16384]
 import argparse
 import random
 import statistics
+import sys
+from pathlib import Path
 
 import torch
 
+try:
+    import fast_diffusion_attention  # noqa: F401
+except ImportError:  # extension built in place (python setup.py build_ext --inplace)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from fast_diffusion_attention import diffusion_attn_func, diffusion_attn_varlen_func
 from fast_diffusion_attention.reference import num_visible_pairs
 
