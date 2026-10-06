@@ -121,25 +121,40 @@ struct DiffusionGeometry {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Forward: the key tiles visited by a query tile.
 //
-// The key tiles of a query tile are enumerated by a virtual index v in [0, n_block_max()):
-//   v in [0, n_clean)                    -> clean key tile v
-//   v in [n_clean, n_clean + n_noisy)    -> noisy key tile noisy_lo + (v - n_clean)   (noisy query tiles only)
-// The mainloop iterates v downwards. The key tiles v >= n_block_mask_min need masking, the ones below are fully
-// visible from every query of the tile.
+// A query tile visits the clean key tiles [0, n_clean) and, for a noisy query tile, the noisy key tiles
+// [noisy_lo, noisy_hi). They are enumerated by a virtual index v in [0, n_block_max()), fully visible key tiles
+// (visible from every query of the tile) first, then the key tiles that need masking:
+//   [clean visible [0, clean_mask_lo) | noisy visible [vis_lo, vis_hi) |
+//    clean masked [clean_mask_lo, n_clean) | noisy masked [noisy_lo, vis_lo) and [vis_hi, noisy_hi)]
+// The mainloop iterates v downwards: the key tiles v >= n_block_mask_min need masking.
+// A noisy key tile is fully visible only if the query tile lies in a single block that contains the key tile
+// (block sizes >= kBlockN); for smaller block sizes the noisy key tiles always need masking.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int kBlockM, int kBlockN>
 struct DiffusionFwdTiles {
 
     int n_clean = 0;
-    int n_noisy = 0;
-    int noisy_lo = 0;
+    int clean_mask_lo = 0;
+    int noisy_lo = 0, noisy_hi = 0;
+    int vis_lo = 0, vis_hi = 0;  // fully visible noisy key tiles, vis_lo == vis_hi if none
     int n_block_mask_min = 0;
 
-    CUTLASS_DEVICE int n_block_max() const { return n_clean + n_noisy; }
-    CUTLASS_DEVICE bool is_noisy(int const v) const { return v >= n_clean; }
+    CUTLASS_DEVICE int n_block_max() const { return n_clean + (noisy_hi - noisy_lo); }
+    CUTLASS_DEVICE bool is_noisy(int const v) const {
+        int const n_vis = vis_hi - vis_lo;
+        return v < n_block_mask_min ? v >= clean_mask_lo : v >= n_clean + n_vis;
+    }
     // Index of key tile v inside its half.
-    CUTLASS_DEVICE int tile_idx(int const v) const { return v < n_clean ? v : noisy_lo + (v - n_clean); }
+    CUTLASS_DEVICE int tile_idx(int const v) const {
+        int const n_vis = vis_hi - vis_lo;
+        if (v < clean_mask_lo) { return v; }                         // clean, visible
+        if (v < n_block_mask_min) { return vis_lo + (v - clean_mask_lo); }  // noisy, visible
+        if (v < n_clean + n_vis) { return v - n_vis; }               // clean, masked
+        int const w = v - (n_clean + n_vis);                         // noisy, masked
+        int const n_low = (n_vis > 0 ? vis_lo : noisy_hi) - noisy_lo;
+        return w < n_low ? noisy_lo + w : vis_hi + (w - n_low);
+    }
 
     CUTLASS_DEVICE
     DiffusionFwdTiles(DiffusionGeometry const& g, bool const q_noisy, int const m_block) {
@@ -150,15 +165,19 @@ struct DiffusionFwdTiles {
         if (!q_noisy) {
             // Clean keys [0, block_end(i)).
             n_clean = cute::ceil_div(cute::min(blk_last + g.bs(), g.n), kBlockN);
-            n_block_mask_min = cute::min(blk_first + g.bs(), g.n) / kBlockN;
+            clean_mask_lo = cute::min(cute::min(blk_first + g.bs(), g.n) / kBlockN, n_clean);
         } else {
             // Clean keys [0, block_start(i)).
             n_clean = cute::ceil_div(blk_last, kBlockN);
-            n_block_mask_min = blk_first / kBlockN;
-            // Noisy keys [block_start(i), block_end(i)).
+            clean_mask_lo = cute::min(blk_first / kBlockN, n_clean);
+            // Noisy keys [block_start(i), block_end(i)). Visible from every query: [blk_last, block_end(i0)).
             noisy_lo = blk_first / kBlockN;
-            n_noisy = cute::ceil_div(cute::min(blk_last + g.bs(), g.n), kBlockN) - noisy_lo;
+            noisy_hi = cute::ceil_div(cute::min(blk_last + g.bs(), g.n), kBlockN);
+            vis_lo = cute::max(cute::ceil_div(blk_last, kBlockN), noisy_lo);
+            vis_hi = cute::min(cute::min(blk_first + g.bs(), g.n) / kBlockN, noisy_hi);
+            if (vis_hi <= vis_lo) { vis_lo = vis_hi = 0; }
         }
+        n_block_mask_min = clean_mask_lo + (vis_hi - vis_lo);
     }
 
 };
@@ -166,38 +185,43 @@ struct DiffusionFwdTiles {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Backward: the query tiles visited by a key tile.
 //
-// The query tiles of a key tile form two lists: list 0 = the query tiles [m0_lo, m0_lo + n_m0) of the same half as
-// the key tile, list 1 = the noisy query tiles [m1_lo, m1_lo + n_m1) (clean key tiles only). The first n_m0_mask
-// (resp. n_m1_mask) tiles of each list need masking (all of them if the key tile extends beyond the end of the half).
-// They are enumerated by a virtual index u in [0, m_block_max()), iterated upwards, masked tiles first:
-//   [list 0 masked | list 1 masked | list 0 fully visible | list 1 fully visible]
+// The query tiles of a key tile form two lists: list 0 = the query tiles [m0_lo, m0_hi) of the same half as the key
+// tile, list 1 = the noisy query tiles [m1_lo, m1_lo + n_m1) (clean key tiles only). In list 0, the query tiles
+// [vis0_lo, vis0_hi) see the whole key tile, the others need masking; in list 1 the first n_m1_mask tiles need
+// masking. Everything needs masking if the key tile extends beyond the end of the half.
+// The query tiles are enumerated by a virtual index u in [0, m_block_max()), iterated upwards, masked tiles first:
+//   [list 0 masked: [m0_lo, vis0_lo) and [vis0_hi, m0_hi) | list 1 masked | list 0 visible | list 1 visible]
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int kBlockM, int kBlockN>
 struct DiffusionBwdTiles {
 
-    int n_m0 = 0;
-    int m0_lo = 0;
-    int n_m0_mask = 0;
+    int m0_lo = 0, m0_hi = 0;
+    int vis0_lo = 0, vis0_hi = 0;  // vis0_lo == vis0_hi if none
     int n_m1 = 0;
     int m1_lo = 0;
     int n_m1_mask = 0;
 
-    CUTLASS_DEVICE int m_block_max() const { return n_m0 + n_m1; }
+    CUTLASS_DEVICE int n_m0_mask() const { return (m0_hi - m0_lo) - (vis0_hi - vis0_lo); }
+    CUTLASS_DEVICE int m_block_max() const { return (m0_hi - m0_lo) + n_m1; }
     // Query tiles u < n_mask() need masking.
-    CUTLASS_DEVICE int n_mask() const { return n_m0_mask + n_m1_mask; }
+    CUTLASS_DEVICE int n_mask() const { return n_m0_mask() + n_m1_mask; }
     // Is query tile u in list 1?
     CUTLASS_DEVICE bool in_list1(int const u) const {
-        return u < n_mask() ? u >= n_m0_mask : u >= n_mask() + (n_m0 - n_m0_mask);
+        return u < n_mask() ? u >= n_m0_mask() : u >= n_mask() + (vis0_hi - vis0_lo);
     }
     // Half of query tile u (k_noisy: half of the key tile).
     CUTLASS_DEVICE bool q_is_noisy(int const u, bool const k_noisy) const { return k_noisy || in_list1(u); }
     // Index of query tile u inside its half.
     CUTLASS_DEVICE int tile_idx(int const u) const {
-        if (u < n_m0_mask) { return m0_lo + u; }
-        if (u < n_mask()) { return m1_lo + (u - n_m0_mask); }
-        int const v = u - n_mask();
-        return v < n_m0 - n_m0_mask ? m0_lo + n_m0_mask + v : m1_lo + n_m1_mask + (v - (n_m0 - n_m0_mask));
+        int const n_vis0 = vis0_hi - vis0_lo;
+        int const n_low0 = (n_vis0 > 0 ? vis0_lo : m0_hi) - m0_lo;
+        int const n_mask0 = n_m0_mask();
+        if (u < n_low0) { return m0_lo + u; }
+        if (u < n_mask0) { return vis0_hi + (u - n_low0); }
+        if (u < n_mask0 + n_m1_mask) { return m1_lo + (u - n_mask0); }
+        int const v = u - (n_mask0 + n_m1_mask);
+        return v < n_vis0 ? vis0_lo + v : m1_lo + n_m1_mask + (v - n_vis0);
     }
 
     CUTLASS_DEVICE
@@ -209,10 +233,11 @@ struct DiffusionBwdTiles {
         int const num_m_blocks = cute::ceil_div(g.n, kBlockM);
         int const blk_first = g.block_start(j0), blk_last = g.block_start(j_last);
         if (!k_noisy) {
-            // Clean queries [block_start(j), n).
+            // Clean queries [block_start(j), n), visible from every key: [blk_last, n)
             m0_lo = blk_first / kBlockM;
-            n_m0 = num_m_blocks - m0_lo;
-            n_m0_mask = !partial ? cute::ceil_div(blk_last, kBlockM) - m0_lo : n_m0;
+            m0_hi = num_m_blocks;
+            vis0_lo = cute::min(cute::ceil_div(blk_last, kBlockM), m0_hi);
+            vis0_hi = m0_hi;
             // Noisy queries [block_start(j) + bs, n).
             if (blk_first + g.bs() < g.n) {
                 m1_lo = (blk_first + g.bs()) / kBlockM;
@@ -220,12 +245,16 @@ struct DiffusionBwdTiles {
                 n_m1_mask = !partial ? cute::ceil_div(cute::min(blk_last + g.bs(), g.n), kBlockM) - m1_lo : n_m1;
             }
         } else {
-            // Noisy queries [block_start(j), block_end(j)).
+            // Noisy queries [block_start(j), block_end(j)). Visible from every key if the key tile is in a single
+            // block: the query tiles inside that block.
             m0_lo = blk_first / kBlockM;
-            n_m0 = cute::ceil_div(cute::min(blk_last + g.bs(), g.n), kBlockM) - m0_lo;
-            n_m0_mask = n_m0;
+            m0_hi = cute::ceil_div(cute::min(blk_last + g.bs(), g.n), kBlockM);
+            if (blk_first == blk_last) {
+                vis0_lo = cute::max(cute::ceil_div(blk_first, kBlockM), m0_lo);
+                vis0_hi = cute::min(cute::min(blk_first + g.bs(), g.n) / kBlockM, m0_hi);
+            }
         }
-        n_m0_mask = cute::max(cute::min(n_m0_mask, n_m0), 0);
+        if (partial || vis0_hi <= vis0_lo) { vis0_lo = vis0_hi = 0; }
         n_m1_mask = cute::max(cute::min(n_m1_mask, n_m1), 0);
     }
 
