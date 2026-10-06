@@ -60,8 +60,11 @@ public:
     static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
 
     /// Register requirement for Load and Math WGs
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 2 ? 24 : 32;
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 240 : 160;
+    // With 2 MMA warpgroups: 40 registers for the producer of the varlen kernels (faster, measured), except with
+    // softcapping for hdim 96 / 128 whose MMA warpgroups would spill with 232; elsewhere 240 for the MMA warpgroups
+    static constexpr bool LargeLoadRegs = Varlen && !(CollectiveMainloop::Has_softcap && (CollectiveMainloop::kHeadDim == 96 || CollectiveMainloop::kHeadDim == 128));
+    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 2 ? (LargeLoadRegs ? 40 : 24) : 32;
+    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? (LargeLoadRegs ? 232 : 240) : 160;
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
     // static constexpr uint32_t LoadRegisterRequirement = 40;
