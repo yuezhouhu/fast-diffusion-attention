@@ -384,3 +384,46 @@ def test_accuracy_matches_fa3(d, dtype):
         err_max, err_max_fa3 = (x - r).abs().max().item(), (y - r).abs().max().item()
         assert err_mean <= 1.1 * err_mean_fa3 + 1e-7, f"{name}: mean error {err_mean} vs FA3 {err_mean_fa3}"
         assert err_max <= 1.5 * err_max_fa3 + atol, f"{name}: max error {err_max} vs FA3 {err_max_fa3}"
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("d", hdims(64))
+def test_long_sequence_tiles(d, varlen, dtype):
+    """Halves longer than fwd_long_seq_threshold (2048 tokens) use other forward tiles for hdim 64 (tile_size.h)."""
+    torch.random.manual_seed(7)
+    nheads, nheads_k, block_size = 2, 1, 4
+    ns = [2100] if not varlen else [300, 2100, 17]
+    cu = torch.tensor([0] + [2 * x for x in ns], device=DEVICE).cumsum(0).to(torch.int32)
+    q, k, v = [torch.randn(int(cu[-1]), h, d, device=DEVICE, dtype=dtype, requires_grad=True)
+               for h in (nheads, nheads_k, nheads_k)]
+    if not varlen:
+        _check_fwd_bwd(*[x.unflatten(0, (1, -1)) for x in (q, k, v)], block_size)
+    else:
+        _check_fwd_bwd(q, k, v, block_size, cu_seqlens=cu, max_seqlen=2 * max(ns))
+
+
+@pytest.mark.skipif(DISABLE_FP8, reason="FP8 kernels not built")
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("d", hdims(128))
+def test_long_sequence_tiles_fp8(d, varlen):
+    """Halves longer than fwd_long_seq_threshold (4096 tokens) use other FP8 forward tiles for hdim 128."""
+    torch.random.manual_seed(8)
+    nheads, nheads_k, block_size = 2, 1, 16
+    ns = [4200] if not varlen else [500, 4200]
+    cu = torch.tensor([0] + [2 * x for x in ns], device=DEVICE).cumsum(0).to(torch.int32)
+    q8, k8, v8 = [torch.randn(int(cu[-1]), h, d, device=DEVICE).to(torch.float8_e4m3fn) for h in (nheads, nheads_k, nheads_k)]
+    if not varlen:
+        # batch of 1 sample: compare batch element 0
+        out = diffusion_attn_func(*[x.unflatten(0, (1, -1)) for x in (q8, k8, v8)], block_size)[0]
+        q16, k16, v16 = [x.to(torch.bfloat16).unflatten(0, (1, -1)) for x in (q8, k8, v8)]
+        out_ref = attention_ref(q16, k16, v16, block_size)[0][0]
+        out_pt = attention_ref(q16, k16, v16, block_size, upcast=False, reorder_ops=True,
+                               intermediate_dtype=torch.float8_e4m3fn)[0][0]
+    else:
+        out = diffusion_attn_varlen_func(q8, k8, v8, cu, cu, 2 * max(ns), 2 * max(ns), block_size)
+        q16, k16, v16 = [x.to(torch.bfloat16) for x in (q8, k8, v8)]
+        out_ref, _ = attention_varlen_ref(q16, k16, v16, cu, block_size)
+        out_pt, _ = attention_varlen_ref(q16, k16, v16, cu, block_size, upcast=False, reorder_ops=True,
+                                         intermediate_dtype=torch.float8_e4m3fn)
+    _errors_ok("out", out, out_ref, out_pt)

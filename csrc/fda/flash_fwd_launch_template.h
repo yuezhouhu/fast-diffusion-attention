@@ -23,13 +23,13 @@
 
 using namespace cute;
 
-template <int kHeadDim, typename Element, typename ElementOut, bool Has_softcap, bool Varlen>
+template <int kHeadDim, typename Element, typename ElementOut, bool Has_softcap, bool Varlen, bool LongSeq>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;
     using ArchTag = cutlass::arch::Sm90;
 
     // Can't use structured binding since it's not compatible with constexpr
-    static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, sizeof(Element) /*element_size*/, Has_softcap);
+    static constexpr std::tuple<int, int, bool, bool> kBlockMN_RS_IntraWGOverlap = tile_size_fwd_sm90(kHeadDim, sizeof(Element) /*element_size*/, Has_softcap, LongSeq);
     static constexpr int kBlockM = std::get<0>(kBlockMN_RS_IntraWGOverlap);
     static constexpr int kBlockN = std::get<1>(kBlockMN_RS_IntraWGOverlap);
     static constexpr bool MmaPV_is_RS = std::get<2>(kBlockMN_RS_IntraWGOverlap);
@@ -117,7 +117,12 @@ void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(sizeof(T) == 2 || sizeof(T) == 1, "Only 16bit and 8bit are supported");
     static constexpr bool Is_FP8 = cute::is_same_v<T, cutlass::float_e4m3_t> || cute::is_same_v<T, cutlass::float_e5m2_t>;
     using T_out = std::conditional_t<!Is_FP8, T, cutlass::bfloat16_t>;
+    // Tile sizes depending on the length of the halves (of the longest sample for varlen), see tile_size_fwd_sm90
+    static constexpr bool HasShortSeqTiles = tile_size_fwd_sm90(kHeadDim, sizeof(T), Has_softcap, false) != tile_size_fwd_sm90(kHeadDim, sizeof(T), Has_softcap, true);
+    bool const long_seq = params.seqlen / 2 > fwd_long_seq_threshold(kHeadDim, sizeof(T));
     VARLEN_SWITCH(params.cu_seqlens, Varlen, [&] {
-        run_flash_fwd<kHeadDim, T, T_out, Has_softcap, Varlen>(params, stream);
+        BOOL_SWITCH(long_seq || !HasShortSeqTiles, LongSeq, [&] {
+            run_flash_fwd<kHeadDim, T, T_out, Has_softcap, Varlen, LongSeq || !HasShortSeqTiles>(params, stream);
+        });
     });
 }
