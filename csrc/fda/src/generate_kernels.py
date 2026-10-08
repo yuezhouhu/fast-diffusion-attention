@@ -67,7 +67,7 @@ void run_mha_bwd_<{DTYPE}, {HEAD_DIM}>(Flash_bwd_params &params, cudaStream_t st
 
 
 # Tuning builds (FDA_TUNING=1): one file per candidate configuration of tuning.h, compiled in parallel
-NUM_TUNING_CANDIDATES = {"fwd": 19, "bwd": 25}
+NUM_TUNING_CANDIDATES = {"fwd": 19, "bwd": 34}
 
 
 def get_tune_template(direction: str) -> str:

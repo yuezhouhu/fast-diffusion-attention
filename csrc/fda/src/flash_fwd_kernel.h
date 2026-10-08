@@ -621,14 +621,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params) {
-    // FlashAttention-2's grid and order: (2 * num_m_blocks, b, h), blockIdx.x enumerating the query tiles of the noisy
-    // half, then those of the clean half: m_block = blockIdx.x on the 2b sequences of length n of causal attention on
-    // the halves.
+    // blockIdx.x enumerates the query tiles of both halves, the most expensive ones first: query tile m of the
+    // noisy half visits the clean key tiles before its blocks and its noisy diagonal, query tile m of the clean half
+    // the clean key tiles up to its own (like causal attention).
+    int tile, bidb, bidh;
+    tile_of_block(params.sched_heads, params.h, tile, bidb, bidh);
     const int num_m_blocks = gridDim.x / 2;
-    const bool q_noisy = int(blockIdx.x) < num_m_blocks;
-    const int m_block = q_noisy ? int(blockIdx.x) : int(blockIdx.x) - num_m_blocks;
-    const int bidb = blockIdx.y;
-    const int bidh = blockIdx.z;
+    const int m_block = num_m_blocks - 1 - tile / 2;
+    const bool q_noisy = tile % 2 == 0;
 
     // We want the fwd and bwd to generate the same dropout pattern (RNG), without restricting
     // them to have the same number of threads or have to traverse the attention matrix

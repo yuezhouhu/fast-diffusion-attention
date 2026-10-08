@@ -77,8 +77,8 @@ make_tiled_copy_C_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_even_MN, bool Is_even_K, bool Is_softcap, typename Params>
-inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const bool k_noisy, const int n_block) {
+template<typename Kernel_traits, bool Is_dropout, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Is_grouped, typename Params>
+inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh_group, const bool k_noisy, const int n_block) {
 
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -115,7 +115,15 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     // Rows of the clean half in the dropout coordinates.
     const int hr = params.seqlen_half_rounded;
 
-    const int num_iters = m_block_max;
+    // The thread block processes the key tile for the params.bwd_heads_per_cta query heads [bidh_group *
+    // bwd_heads_per_cta, ...) that share a KV head (GQA), accumulating dK / dV over these heads: the iterations
+    // run over (query tile u, query head g), the heads inner. bwd_heads_per_cta = h / h_k gives the final dK / dV of the
+    // KV head, without the reduction over the query heads of FlashAttention-2 (dk_expanded).
+    // Is_grouped = false: one query head per thread block (bwd_heads_per_cta = 1), the head loop is compiled out.
+    const int heads_per_cta = Is_grouped ? params.bwd_heads_per_cta : 1;
+    const int num_iters = heads_per_cta * m_block_max;
+    int bidh = bidh_group * heads_per_cta;
+    int g = 0;
     // The current query tile u: its half, its index inside the half, its first row in the sample and in the padded
     // accumulators.
     int u = 0;
@@ -462,9 +470,19 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         Tensor acc_dq = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
         clear(acc_dq);
 
-        // The next query tile
+        // The next iteration. Grouped: the same query tile for the next head, then the next query tile for the first
+        // head. The thread blocks of the key tiles of a KV head then visit the query tiles in step, as those of a head
+        // without grouping, and share the Q / dO / dQaccum tiles in the L2. Head by head instead, they drift apart (the
+        // key tiles with fewer query tiles move on to the next heads first) and the working set grows to all the heads
+        // of the group: measured 1-15% slower (A800, L40S, RTX A6000), up to 40% with many heads per thread block.
         const bool has_next = it + 1 < num_iters;
-        const int u_next = u + 1;
+        bool head_step = false;
+        int u_next = u + 1, g_next = g;
+        if constexpr (Is_grouped) {
+            head_step = g + 1 < heads_per_cta;
+            u_next = head_step ? u : u + 1;
+            g_next = head_step ? g + 1 : 0;
+        }
         bool q_noisy_next = q_noisy;
         int m_block_next = m_block, q_row_next = q_row, q_row_padded_next = q_row_padded;
         // Offsets of the next tile w.r.t. the current one (in elements). Inside a run of the enumeration, the next
@@ -472,7 +490,12 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // in the common case, which matters (measured: 1.5% of the backward for long sequences).
         index_t q_delta = -q_tile_stride, do_delta = -do_tile_stride, dq_accum_delta = -dq_accum_tile_stride, lse_delta = -kBlockM;
         if (has_next) {
-            if (!run_starts.test(u_next)) {
+            if (head_step) {
+                q_delta = 0;
+                do_delta = 0;
+                dq_accum_delta = 0;
+                lse_delta = 0;
+            } else if (u_next == u + 1 && !run_starts.test(u_next)) {
                 m_block_next = m_block - 1;
                 q_row_next = q_row - kBlockM;
                 q_row_padded_next = q_row_padded - kBlockM;
@@ -485,6 +508,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 do_delta = index_t(q_row_next - q_row) * params.do_row_stride;
                 dq_accum_delta = index_t(q_row_padded_next - q_row_padded) * dq_accum_row_stride;
                 lse_delta = index_t(q_row_padded_next - q_row_padded);
+            }
+            if constexpr (Is_grouped) {
+                const int head_delta = g_next - g;
+                q_delta += index_t(head_delta) * params.q_head_stride;
+                do_delta += index_t(head_delta) * params.do_head_stride;
+                dq_accum_delta += index_t(head_delta) * params.d_rounded;
+                lse_delta += index_t(head_delta) * params.total_padded;
             }
         }
 
@@ -553,6 +583,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         }
 
         u = u_next;
+        bidh += g_next - g;
+        g = g_next;
         q_noisy = q_noisy_next;
         m_block = m_block_next;
         q_row = q_row_next;
@@ -591,11 +623,11 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     cute::copy(smem_tiled_copy_dKV, taccdKrdK, taccdKsdK);
     cute::copy(smem_tiled_copy_dKV, taccdVrdV, taccdVsdV);
 
-    // dK / dV of query head bidh (FlashAttention-2's dk_expanded / dv_expanded for MQA / GQA)
+    // dK / dV summed over the query heads of the group: head bidh_group of the (partial) dK / dV buffer
     const index_t row_offset_dk = binfo.offset(params.dk_batch_stride, params.dk_row_stride, bidb)
-       + index_t(k_row0) * params.dk_row_stride + bidh * params.dk_head_stride;
+       + index_t(k_row0) * params.dk_row_stride + bidh_group * params.dk_head_stride;
     const index_t row_offset_dv = binfo.offset(params.dv_batch_stride, params.dv_row_stride, bidb)
-       + index_t(k_row0) * params.dv_row_stride + bidh * params.dv_head_stride;
+       + index_t(k_row0) * params.dv_row_stride + bidh_group * params.dv_head_stride;
     Tensor gdK = make_tensor(make_gmem_ptr(reinterpret_cast<Element *>(params.dk_ptr) + row_offset_dk),
                              Shape<Int<kBlockN>, Int<kHeadDim>>{},
                              make_stride(params.dk_row_stride, _1{}));
@@ -632,21 +664,29 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_even_MN, bool Is_even_K, bool Is_softcap, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Is_grouped, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
-    // FlashAttention-2's grid and order: (2 * num_n_blocks, b, h), or (nsplits, b, h) if deterministic, and the key
-    // tiles t = blockIdx.x, blockIdx.x + gridDim.x, ... (if deterministic, each thread block does atomicAdd to its own
-    // dQ_accum buffer). t enumerates the key tiles of the noisy half, then those of the clean half: n_block =
-    // blockIdx.x on the 2b sequences of length n of causal attention on the halves.
-    // A single call site of compute_dq_dk_dv_1colblock (inlined; two call sites double the code of the kernel).
+    // Key tiles of both halves, the most expensive ones first: the clean key tiles (seen by the queries of both
+    // halves, tile 0 by all of them), then the noisy key tiles (seen by the noisy queries of their blocks).
     const int num_n_blocks = (params.seqlen / 2 + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
-    const int bidb = blockIdx.y;
-    const int bidh = blockIdx.z;
-    for (int t = blockIdx.x; t < 2 * num_n_blocks; t += gridDim.x) {
-        const bool k_noisy = t < num_n_blocks;
-        const int n_block = k_noisy ? t : t - num_n_blocks;
-        FLASH_NAMESPACE::compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_even_MN, Is_even_K, Is_softcap>(params, bidb, bidh, k_noisy, n_block);
+    // A single call site of compute_dq_dk_dv_1colblock (inlined; two call sites double the code of the kernel, ~1%
+    // slower): one key tile per thread block (in the order of tile_of_block), or, if deterministic, the key tiles
+    // blockIdx.x, blockIdx.x + gridDim.x, ... (each thread block does atomicAdd to a different dQ_accum buffer).
+    int t, bidb, bidh_group, stride;
+    if (!params.deterministic) {
+        tile_of_block(params.sched_heads, params.h / params.bwd_heads_per_cta, t, bidb, bidh_group);
+        stride = 2 * num_n_blocks;
+    } else {
+        t = blockIdx.x;
+        bidb = blockIdx.y;
+        bidh_group = blockIdx.z;
+        stride = gridDim.x;
+    }
+    for (; t < 2 * num_n_blocks; t += stride) {
+        const bool k_noisy = t >= num_n_blocks;
+        const int n_block = k_noisy ? t - num_n_blocks : t;
+        FLASH_NAMESPACE::compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_even_MN, Is_even_K, Is_softcap, Is_grouped>(params, bidb, bidh_group, k_noisy, n_block);
     }
 }
 

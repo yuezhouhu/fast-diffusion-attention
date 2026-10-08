@@ -20,6 +20,7 @@
 #include <cstdlib>
 
 #include "flash.h"
+#include "hardware_info.h"  // parse_env_int
 
 namespace FLASH_NAMESPACE {
 
@@ -59,6 +60,9 @@ namespace FLASH_NAMESPACE {
     X(18, 64, 128, 4, true, false)
 constexpr int kNumFwdCandidates = 19;
 
+// Backward candidates 25-33 are not in FlashAttention-2's search space: configurations of ours from the earlier
+// versions of the tuning (64 x 32 and 32 x 64 tiles that fit 99 KB without V in registers for large head dimensions,
+// other atom layouts and double buffering choices).
 // Backward candidates: (index, kBlockM, kBlockN, kNWarps, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ, Is_V_in_regs,
 // No_double_buffer)
 #define FDA_BWD_CANDIDATES(X)                       \
@@ -86,8 +90,17 @@ constexpr int kNumFwdCandidates = 19;
     X(21, 128, 64, 8, 4, 4, 4, false, false)        \
     X(22, 64, 64, 8, 4, 2, 2, true, true)           \
     X(23, 64, 64, 8, 4, 2, 2, false, true)          \
-    X(24, 64, 32, 8, 4, 1, 2, true, true)
-constexpr int kNumBwdCandidates = 25;
+    X(24, 64, 32, 8, 4, 1, 2, true, true)           \
+    X(25, 64, 128, 8, 2, 4, 4, false, true)         \
+    X(26, 64, 64, 8, 4, 4, 4, false, false)         \
+    X(27, 64, 64, 8, 4, 4, 4, true, false)          \
+    X(28, 128, 64, 8, 4, 4, 4, true, false)         \
+    X(29, 64, 32, 8, 4, 2, 2, false, true)          \
+    X(30, 64, 32, 8, 4, 2, 4, false, true)          \
+    X(31, 32, 64, 8, 2, 2, 2, false, false)         \
+    X(32, 32, 64, 8, 2, 2, 2, false, true)          \
+    X(33, 64, 32, 8, 4, 2, 2, true, true)
+constexpr int kNumBwdCandidates = 34;
 
 // Rows covered by one pass of the global memory copies of the kernel traits (GmemLayoutAtom): the tiles must be
 // multiples of it (FlashAttention-2 never uses the other configurations, e.g. 32-key tiles with 8 warps for head
@@ -126,7 +139,7 @@ template<typename T, int Headdim, int I> void run_mha_bwd_candidate(Flash_bwd_pa
 
 inline int tuning_choice(const char *env_name) {
     const char *s = std::getenv(env_name);
-    return s == nullptr ? -1 : std::atoi(s);
+    return s == nullptr ? -1 : parse_env_int(s);
 }
 
 #define FDA_FWD_CANDIDATE_CASE(I, ...) case I: run_mha_fwd_candidate<T, Headdim, I>(params, stream); return true;

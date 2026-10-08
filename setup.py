@@ -53,7 +53,7 @@ CUDA_ARCHS = [a.strip() for a in os.getenv("FDA_CUDA_ARCHS", "80").split(";") if
 
 
 TUNING = env_flag("FDA_TUNING")
-NUM_TUNING_CANDIDATES = {"fwd": 19, "bwd": 25}  # as in csrc/fda/src/tuning.h, generate_kernels.py, tune_configs.py
+NUM_TUNING_CANDIDATES = {"fwd": 19, "bwd": 34}  # as in csrc/fda/src/tuning.h, generate_kernels.py, tune_configs.py
 
 
 def kernel_sources():

@@ -111,6 +111,8 @@ struct Flash_fwd_params : public Qkv_params {
     // (1: the standard kernel), the FP32 partial outputs (num_splits, b, h, seqlen, d_rounded) and log-sum-exps
     // (num_splits, b, h, seqlen), combined by flash_fwd_splitkv_combine_kernel.
     int num_splits;
+    // (batch, head) pairs per group of the thread block order (tile_of_block in diffusion.h)
+    int sched_heads;
     void * __restrict__ oaccum_ptr;
     void * __restrict__ softmax_lseaccum_ptr;
 };
@@ -151,6 +153,11 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     bool deterministic;
     index_t dq_accum_split_stride;
+
+    // Number of query heads (dividing h / h_k) processed by a thread block of the backward kernel, which sums their
+    // dK / dV: dK / dV point to a (..., h / bwd_heads_per_cta, d) buffer, the final dK / dV if bwd_heads_per_cta =
+    // h / h_k.
+    int bwd_heads_per_cta;
 };
 
 

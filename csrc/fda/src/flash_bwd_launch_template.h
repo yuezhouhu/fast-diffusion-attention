@@ -39,9 +39,9 @@ namespace FLASH_NAMESPACE {
 template<typename Kernel_traits, __VA_ARGS__> \
 __global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_bwd_params params)
 
-DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel, bool Is_dropout, bool Is_even_MN, bool Is_even_K, bool Is_softcap) {
+DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel, bool Is_dropout, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Is_grouped) {
     #if defined(ARCH_SUPPORTS_FLASH)
-        FLASH_NAMESPACE::compute_dq_dk_dv_seqk_parallel<Kernel_traits, Is_dropout, Is_even_MN, Is_even_K, Is_softcap>(params);
+        FLASH_NAMESPACE::compute_dq_dk_dv_seqk_parallel<Kernel_traits, Is_dropout, Is_even_MN, Is_even_K, Is_softcap, Is_grouped>(params);
     #else
         FLASH_UNSUPPORTED_ARCH
     #endif
@@ -59,7 +59,7 @@ __global__ void flash_bwd_convert_dq_kernel(const Flash_bwd_params params, const
 
 template<typename Kernel_traits, bool Is_dropout>
 void run_flash_bwd_dq_dk_dv(Flash_bwd_params &params, cudaStream_t stream, const int gridDimx) {
-    dim3 grid_n(gridDimx, params.b, params.h);
+    dim3 grid_n(gridDimx, params.b, params.h / params.bwd_heads_per_cta);
     const int seqlen_half = params.seqlen / 2;
     // We want to specialize to is_even_MN and not just is_even_M, since in the case where N is not
     // a multiple of kBlockN, we'll need to apply mask in the loop.
@@ -69,15 +69,20 @@ void run_flash_bwd_dq_dk_dv(Flash_bwd_params &params, cudaStream_t stream, const
     BOOL_SWITCH(is_even_MN, IsEvenMNConst, [&] {
         EVENK_SWITCH(is_even_K, IsEvenKConst, [&] {
             SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
-                // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
-                // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
-                auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout && !Is_softcap, IsEvenMNConst && IsEvenKConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap>;
-                if (smem_size_dq_dk_dv >= 48 * 1024)  {
-                    C10_CUDA_CHECK(cudaFuncSetAttribute(
-                        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
-                }
-                kernel<<<grid_n, Kernel_traits::kNThreads, smem_size_dq_dk_dv, stream>>>(params);
-                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                // Several query heads per thread block (GQA, see bwd_heads_per_cta in flash_api.cpp): only without
+                // dropout and softcapping (flash_api.cpp then uses one head per thread block), to reduce the number of
+                // templates.
+                BOOL_SWITCH(params.bwd_heads_per_cta > 1, IsGroupedConst, [&] {
+                    // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
+                    // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
+                    auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout && !Is_softcap, IsEvenMNConst && IsEvenKConst && Kernel_traits::kHeadDim <= 128, IsEvenKConst, Is_softcap, IsGroupedConst && !Is_dropout && !Is_softcap>;
+                    if (smem_size_dq_dk_dv >= 48 * 1024)  {
+                        C10_CUDA_CHECK(cudaFuncSetAttribute(
+                            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
+                    }
+                    kernel<<<grid_n, Kernel_traits::kNThreads, smem_size_dq_dk_dv, stream>>>(params);
+                    C10_CUDA_KERNEL_LAUNCH_CHECK();
+                });
             });
         });
     });
@@ -92,10 +97,9 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) 
     const int num_n_block = (seqlen_half + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
     int gridDimx = 2 * num_n_block;
     if (params.deterministic) {
-        // FlashAttention-2: one wave of thread blocks, each with its own dQaccum buffer (must match the number of
-        // buffers allocated in flash_api.cpp)
-        const int num_sm = get_num_sm(get_current_device());
-        gridDimx = (num_sm + params.b * params.h - 1) / (params.b * params.h);
+        // Thread blocks for about 2 waves, each with its own dQaccum buffer (must match the number of buffers
+        // allocated in flash_api.cpp; no GQA grouping in deterministic mode)
+        gridDimx = get_deterministic_splits(get_num_sm(get_current_device()), params.b * params.h, 2 * ((seqlen_half + 63) / 64));
     }
 
     if (!params.deterministic) {
@@ -105,6 +109,16 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) 
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 
+    // Order of the thread blocks (tile_of_block in diffusion.h): groups of about 4 waves, 2 for head dimensions > 128
+    // (the memory-bound noisy diagonal key tiles need the Q / dO tiles of their group in L2). The data shared by the
+    // thread blocks of a (batch, head), Q and dO (16 bits) and the FP32 dQ accumulators of the sample, for the
+    // bwd_heads_per_cta query heads of a thread block, must fit in twice the L2 for a group: binds on GPUs with little
+    // L2 (RTX A6000: GQA grouping 5-10% faster with it at short sequences; A800 neutral, L40S never binding).
+    {
+        const int64_t bytes_per_bh = int64_t(8) * params.bwd_heads_per_cta * params.seqlen * params.d;
+        params.sched_heads = get_sched_heads("FDA_SCHED_HEADS_BWD", 2 * num_n_block, params.b * (params.h / params.bwd_heads_per_cta),
+                                             get_num_sm(get_current_device()), /*waves=*/Kernel_traits::kHeadDim > 128 ? 2 : 4, bytes_per_bh);
+    }
     run_flash_bwd_dq_dk_dv<Kernel_traits, Is_dropout>(params, stream, gridDimx);
 
     auto kernel_dq = &flash_bwd_convert_dq_kernel<Kernel_traits>;
@@ -202,10 +216,16 @@ void run_mha_bwd_hdim192(Flash_bwd_params &params, cudaStream_t stream) {
         if (max_smem_per_block >= 136 * 1024) {
             run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, false, false, T>, Is_dropout>(params, stream);
         } else {
-            // The only configuration of FlashAttention-2's search space that fits in 99 KB (V in registers, no double
-            // buffering). It spills, and its local memory traffic (~11 GB per call at 16K tokens) does not stay in an
-            // L2 of 6 MB: slower than FlashAttention-2 on RTX A6000 (see README).
-            run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, true, true, T>, Is_dropout>(params, stream);
+            if constexpr(!Is_dropout) {
+                // FlashAttention-2's 64 x 64 (V in registers, no double buffering: the only 64 x 64 that fits in 99 KB)
+                // spills more in our kernel than in FlashAttention-2's, and the local memory traffic (~11 GB per call
+                // at 16K tokens) does not stay in an L2 of 6 MB. 32 x 64 tiles fit without V in registers (RTX A6000:
+                // 1.1-1.4x FlashAttention-2 instead of 0.6-0.8x; also the best configuration on L40S). They cannot do
+                // dropout (16 x 32 blocks of random numbers).
+                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 32, 64, 8, 2, 2, 2, false, false, T>, Is_dropout>(params, stream);
+            } else {
+                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 64, 8, 4, 2, 2, true, true, T>, Is_dropout>(params, stream);
+            }
         }
     });
 }

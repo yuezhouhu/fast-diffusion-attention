@@ -60,10 +60,12 @@ template<typename Kernel_traits, bool Is_dropout>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr size_t smem_size = Kernel_traits::kSmemSize;
 
-    // The query tiles of the two halves of every sample (see compute_attn).
+    // The query tiles of the two halves of every sample (see compute_attn), in groups of sched_heads (batch, head)
+    // pairs of about 4 waves of thread blocks (tile_of_block in diffusion.h).
     const int seqlen_half = params.seqlen / 2;
     const int num_m_block = (seqlen_half + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(2 * num_m_block, params.b, params.h);
+    params.sched_heads = get_sched_heads("FDA_SCHED_HEADS_FWD", 2 * num_m_block, params.b * params.h, get_num_sm(get_current_device()));
     const bool is_even_MN = params.cu_seqlens == nullptr && seqlen_half % Kernel_traits::kBlockN == 0 && seqlen_half % Kernel_traits::kBlockM == 0;
     const bool is_even_K = params.d == Kernel_traits::kHeadDim;
     const bool return_softmax = params.p_ptr != nullptr;
@@ -164,17 +166,18 @@ template<typename T>
 void run_mha_fwd_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 32;
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x = cc_major == 8 && cc_minor > 0;
+    bool is_sm89 = cc_major == 8 && cc_minor == 9;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         if constexpr(!Is_dropout) {
-            if (is_sm8x) {
+            if (is_sm89) {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout>(params, stream);
             } else {
-                // A100: 64 x 64 is 5.9% faster
+                // A100: 64 x 64 is 5.9% faster; RTX A6000: 3.5%
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout>(params, stream);
             }
         } else {
-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout>(params, stream);
+            // 128 x 64 with Q in registers: A800 / RTX A6000 / L40S 8.7% / 8.3% / 5.7% faster than 128 x 128
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout>(params, stream);
         }
     });
 }
@@ -182,16 +185,11 @@ void run_mha_fwd_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T>
 void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
-    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x = cc_major == 8 && cc_minor > 0;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         if constexpr(!Is_dropout) {
-            if (is_sm8x) {
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout>(params, stream);
-            } else {
-                // A100: 128 x 64 with Q in registers is 11.8% faster
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout>(params, stream);
-            }
+            // 128 x 64 with Q in registers: A100 11.8% faster than 128 x 64, RTX A6000 / L40S 20.4% / 13.2% faster
+            // than 128 x 128
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, true, false, T>, Is_dropout>(params, stream);
         } else {
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout>(params, stream);
         }
@@ -202,11 +200,17 @@ template<typename T>
 void run_mha_fwd_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 96;
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x = cc_major == 8 && cc_minor > 0;
+    bool is_sm89 = cc_major == 8 && cc_minor == 9;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
-        if (is_sm8x) {
-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout>(params, stream);
+        // 128 x 64 also on sm86 / sm89 (FlashAttention-2: 64 x 64, square, for causal): RTX A6000 / L40S 9.6% / 17.5%
+        // faster than 64 x 64, 10.5% / 13.9% with dropout
+        if constexpr(!Is_dropout) {
+            if (is_sm89 && params.seqlen / 2 > 2048) {
+                // L40S: 256 x 64 with 8 warps above 2K tokens per half, 3.1% faster (geometric mean, two runs)
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 256, 64, 8, false, false, T>, Is_dropout>(params, stream);
+            } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout>(params, stream);
+            }
         } else {
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout>(params, stream);
         }
@@ -218,17 +222,34 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x = cc_major == 8 && cc_minor > 0;
+    bool is_sm89 = cc_major == 8 && cc_minor == 9;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         if constexpr(!Is_dropout) {
-            // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
-            if (is_sm8x) {
+            if (is_sm89) {
+                // L40S: 128 x 64 is 14.8% faster than 64 x 64 (RTX A6000: 8.8% slower)
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout>(params, stream);
+            } else if (is_sm8x) {
+                // For sm86, 64 x 64 is the fastest for causal (because it's square),
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout>(params, stream);
             } else {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout>(params, stream);
             }
         } else {
-            if (is_sm8x) {
-                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout>(params, stream);
+            if (is_sm89) {
+                // L40S: 128 x 64 with 8 warps up to 2K tokens per half, 256 x 64 with 8 warps above: 5.0% faster than
+                // 128 x 32 (two runs: 5.0% / 5.3%)
+                if (params.seqlen / 2 <= 2048) {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout>(params, stream);
+                } else {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 256, 64, 8, false, false, T>, Is_dropout>(params, stream);
+                }
+            } else if (is_sm8x) {
+                // RTX A6000: 64 x 64 up to 1K tokens per half, 128 x 32 above: 3.5% faster than 128 x 32
+                if (params.seqlen / 2 <= 1024) {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout>(params, stream);
+                } else {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout>(params, stream);
+                }
             } else {
                 // A100: 64 x 64 is 3.3% faster
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout>(params, stream);
@@ -240,11 +261,26 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T>
 void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 192;
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    bool is_sm8x = cc_major == 8 && cc_minor > 0;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         if constexpr(!Is_dropout) {
-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout>(params, stream);
+            if (is_sm8x) {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout>(params, stream);
+            } else if (params.seqlen / 2 <= 2048) {
+                // A800: 64 x 64 up to 2K tokens per half, 128 x 128 with 8 warps above: 9.1% faster than 128 x 64 with
+                // 8 warps (64 x 64 everywhere: 5.6%)
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout>(params, stream);
+            } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 8, false, false, T>, Is_dropout>(params, stream);
+            }
         } else {
-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout>(params, stream);
+            if (is_sm8x) {
+                // RTX A6000 / L40S: 128 x 64 with 8 warps is 8.2% / 15.0% faster
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout>(params, stream);
+            } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout>(params, stream);
+            }
         }
     });
 }
@@ -252,6 +288,9 @@ void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T>
 void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 256;
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
+    bool is_sm8x = cc_major == 8 && cc_minor > 0;
+    bool is_sm89 = cc_major == 8 && cc_minor == 9;
     int max_smem_per_sm = get_max_smem_per_sm(get_current_device());
     int max_smem_per_block = get_max_smem_per_block(get_current_device());
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
@@ -260,7 +299,21 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
         if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64) && max_smem_per_sm < 4 * Headdim * (64 + 2 * 64)) {
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout>(params, stream);
         } else {
-            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout>(params, stream);
+            if constexpr(Is_dropout) {
+                if (is_sm8x) {
+                    // RTX A6000 / L40S: 128 x 32 with 8 warps is 4.3% / 6.9% faster
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 8, false, false, T>, Is_dropout>(params, stream);
+                } else {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout>(params, stream);
+                }
+            } else {
+                if (is_sm89) {
+                    // L40S: 128 x 32 with 8 warps is 4.7% faster (RTX A6000: 1.7% slower)
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 8, false, false, T>, Is_dropout>(params, stream);
+                } else {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout>(params, stream);
+                }
+            }
         }
     });
 }

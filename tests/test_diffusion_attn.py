@@ -111,6 +111,45 @@ def dropout_mask_of(S_dmask, n, block_size):
     return keep, fraction
 
 
+# Attention matrices of more elements than this: the references are computed sample by sample, each with its backward
+# right away. The samples are independent, so this gives the same values with the memory of one sample (the long
+# sequences of FlashAttention-3's cases would not fit in 46-48 GB otherwise).
+_REF_CHUNK_ELEMENTS = 2 ** 28
+
+
+def _ref_results(q, k, v, g, block_size, cu_seqlens=None, dropout_mask=None, **kw):
+    """(out, lse, dq, dk, dv) of attention_ref (batched inputs) or attention_varlen_ref (packed samples, cu_seqlens),
+    with the keyword arguments kw of the reference."""
+    if cu_seqlens is None:
+        b, S, h = q.shape[0], q.shape[1], q.shape[2]
+        if b * h * S * S <= _REF_CHUNK_ELEMENTS:
+            out, lse, _ = attention_ref(q, k, v, block_size, dropout_mask=dropout_mask, **kw)
+            return (out, lse) + torch.autograd.grad(out, (q, k, v), g)
+        parts = []
+        for i in range(b):
+            qi, ki, vi = [x[i:i + 1].detach().requires_grad_() for x in (q, k, v)]
+            mi = None if dropout_mask is None else dropout_mask[i:i + 1]
+            out, lse, _ = attention_ref(qi, ki, vi, block_size, dropout_mask=mi, **kw)
+            parts.append((out.detach(), lse.detach()) + torch.autograd.grad(out, (qi, ki, vi), g[i:i + 1]))
+        return tuple(torch.cat(t, dim=0) for t in zip(*parts))
+    cu = cu_seqlens.tolist()
+    h = q.shape[1]
+    if h * sum((cu[i + 1] - cu[i]) ** 2 for i in range(len(cu) - 1)) <= _REF_CHUNK_ELEMENTS:
+        out, lse = attention_varlen_ref(q, k, v, cu_seqlens, block_size, dropout_mask=dropout_mask, **kw)
+        return (out, lse) + torch.autograd.grad(out, (q, k, v), g)
+    parts = []
+    for i in range(len(cu) - 1):
+        s, e = cu[i], cu[i + 1]
+        qi, ki, vi = [x[s:e].detach().requires_grad_() for x in (q, k, v)]
+        mi = None if dropout_mask is None else [dropout_mask[i]]
+        cu_i = torch.tensor([0, e - s], device=cu_seqlens.device, dtype=cu_seqlens.dtype)
+        out, lse = attention_varlen_ref(qi, ki, vi, cu_i, block_size, dropout_mask=mi, **kw)
+        parts.append((out.detach(), lse.detach()) + torch.autograd.grad(out, (qi, ki, vi), g[s:e]))
+    outs, lses, dqs, dks, dvs = zip(*parts)
+    return (torch.cat(outs, dim=0), torch.cat(lses, dim=-1), torch.cat(dqs, dim=0), torch.cat(dks, dim=0),
+            torch.cat(dvs, dim=0))
+
+
 def _check(q, k, v, block_size, dropout_p=0.0, softcap=0.0, deterministic=False, cu_seqlens=None, max_seqlen=None,
            packing=None, check_lse=True):
     """Runs the kernel (batched if cu_seqlens is None, else varlen; packing: None / 'kv' / 'qkv') and compares the
@@ -135,9 +174,7 @@ def _check(q, k, v, block_size, dropout_p=0.0, softcap=0.0, deterministic=False,
             dropout_mask, fraction = dropout_mask_of(S_dmask, n, block_size)
             assert abs(fraction - dropout_p) <= 0.01 + 2.0 / math.sqrt(max(num_visible_pairs(n, block_size), 1)), \
                 f"dropout fraction {fraction} vs {dropout_p}"
-        ref_kw = dict(softcap=softcap, dropout_p=dropout_p, dropout_mask=dropout_mask)
-        out_ref, lse_ref, _ = attention_ref(q, k, v, block_size, **ref_kw)
-        out_pt, lse_pt, _ = attention_ref(q, k, v, block_size, upcast=False, reorder_ops=True, **ref_kw)
+        ref_mask = dropout_mask
     else:
         if packing == "qkv":
             qkv = torch.stack([q, k, v], dim=1).detach().requires_grad_()
@@ -160,10 +197,11 @@ def _check(q, k, v, block_size, dropout_p=0.0, softcap=0.0, deterministic=False,
                 n_i = (cu[i + 1] - cu[i]) // 2
                 keep, _ = dropout_mask_of(S_dmask[i:i + 1], n_i, block_size)
                 dropout_masks.append(keep)
-        ref_kw = dict(softcap=softcap, dropout_p=dropout_p, dropout_mask=dropout_masks)
-        out_ref, lse_ref = attention_varlen_ref(q, k, v, cu_seqlens, block_size, **ref_kw)
-        out_pt, lse_pt = attention_varlen_ref(q, k, v, cu_seqlens, block_size, upcast=False, reorder_ops=True,
-                                              **ref_kw)
+        ref_mask = dropout_masks
+    # The references: float32, and a plain PyTorch implementation in the input precision (output and gradients)
+    ref_kw = dict(cu_seqlens=cu_seqlens, dropout_mask=ref_mask, softcap=softcap, dropout_p=dropout_p)
+    out_ref, lse_ref, dq_ref, dk_ref, dv_ref = _ref_results(q, k, v, g, block_size, **ref_kw)
+    out_pt, lse_pt, dq_pt, dk_pt, dv_pt = _ref_results(q, k, v, g, block_size, upcast=False, reorder_ops=True, **ref_kw)
     _errors_ok("out", out, out_ref, out_pt)
     if check_lse:
         assert (lse - lse_ref).abs().max().item() <= 2 * (lse_pt - lse_ref).abs().max().item() + 1e-4
@@ -177,8 +215,6 @@ def _check(q, k, v, block_size, dropout_p=0.0, softcap=0.0, deterministic=False,
         dk, dv = grads[1].unbind(dim)
     else:
         dq, dk, dv = grads
-    dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q, k, v), g)
-    dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q, k, v), g)
     for name, x, r, p in [("dq", dq, dq_ref, dq_pt), ("dk", dk, dk_ref, dk_pt), ("dv", dv, dv_ref, dv_pt)]:
         _errors_ok(name, x, r, p)
     return out, (dq, dk, dv)
@@ -282,21 +318,24 @@ def test_diffusion_attn_varlen(block_size, nheads, nheads_k, deterministic, drop
 
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("d", hdims(32, 64, 96, 128, 192, 256))
+@pytest.mark.parametrize("dropout_p", DROPOUTS)
 @pytest.mark.parametrize("varlen", [False, True])
 @pytest.mark.parametrize("block_size", [4, 7])
 @pytest.mark.parametrize("n", [600, 1100, 2100])
-def test_long_sequence_tiles(n, block_size, varlen, d, dtype):
+def test_long_sequence_tiles(n, block_size, varlen, dropout_p, d, dtype):
     """Long halves (several 128-row query tiles, partial last tiles), with block sizes that divide 16 (16-key
-    diagonal sub-tiles of the 128-row forward tiles) and that do not, batched and varlen."""
+    diagonal sub-tiles of the 128-row forward tiles) and that do not, batched and varlen, with and without dropout:
+    both sides of the length-dependent configurations of the dispatch (1K and 2K tokens per half)."""
+    _skip_unsupported(d, dropout_p)
     torch.random.manual_seed(n + d + block_size)
     nheads, nheads_k = 2, 1
     ns = [n] if not varlen else [300, n, 17]
     cu = torch.tensor([0] + [2 * x for x in ns], device=DEVICE).cumsum(0).to(torch.int32)
     q, k, v = [_rand((int(cu[-1]), h, d), dtype) for h in (nheads, nheads_k, nheads_k)]
     if not varlen:
-        _check(*[x.detach().unflatten(0, (1, -1)).requires_grad_() for x in (q, k, v)], block_size)
+        _check(*[x.detach().unflatten(0, (1, -1)).requires_grad_() for x in (q, k, v)], block_size, dropout_p=dropout_p)
     else:
-        _check(q, k, v, block_size, cu_seqlens=cu, max_seqlen=2 * max(ns))
+        _check(q, k, v, block_size, dropout_p=dropout_p, cu_seqlens=cu, max_seqlen=2 * max(ns))
 
 
 def test_zero_length_varlen_sample():
@@ -331,6 +370,88 @@ def test_varlen_matches_batched(d, monkeypatch):
     assert torch.equal(lse.permute(1, 0, 2).reshape(nheads, -1), lse_v)
     for x, y in zip(grads, grads_v):
         assert torch.equal(x.reshape(-1, *x.shape[2:]), y)
+
+
+# MQA / GQA cases of FlashAttention-3's tests (hopper/test_flash_attn.py, test_flash_attn_output and
+# test_flash_attn_varlen_output): mha_type mha / mqa / gqa with nheads = 6 and nheads_kv = 6 / 1 / 2, batch size 9 (2
+# beyond 2048 tokens), BF16 / FP16, softcap 0 / 15, all the head dimensions, its equal query / key lengths L as the
+# lengths of the halves (samples of 2L tokens), its random varlen lengths (generate_random_padding_mask, mode
+# "random": [max(1, L - 20), L]). Block sizes 1 (the clean half is causal attention, FlashAttention-3's causal), 4
+# (divides 16) and 64. The GQA-grouped backward is exercised by running the suite with FDA_BWD_HEADS_PER_CTA.
+def _fa3_nheads(mha_type):
+    nheads = 6
+    return nheads, nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
+@pytest.mark.parametrize("d", hdims(32, 64, 96, 128, 192, 256))
+@pytest.mark.parametrize("block_size", [1, 4, 64])
+@pytest.mark.parametrize("L", [1, 256, 1024, 4096, 4224])
+def test_gqa_fa3(L, block_size, d, softcap, mha_type, dtype, request):
+    if L >= 2048:
+        request.getfixturevalue("large_memory")
+    torch.random.manual_seed(0)
+    batch_size = 9 if L <= 2048 else 2
+    nheads, nheads_kv = _fa3_nheads(mha_type)
+    q = _rand((batch_size, 2 * L, nheads, d), dtype)
+    k = _rand((batch_size, 2 * L, nheads_kv, d), dtype)
+    v = _rand((batch_size, 2 * L, nheads_kv, d), dtype)
+    _check(q, k, v, block_size, softcap=softcap)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("softcap", [0.0] + ([15.0] if not DISABLE_SOFTCAP else []))
+@pytest.mark.parametrize("d", hdims(32, 64, 96, 128, 192, 256))
+@pytest.mark.parametrize("block_size", [1, 4, 64])
+@pytest.mark.parametrize("L", [1, 128, 256, 1024, 2048, 4096])
+def test_gqa_fa3_varlen(L, block_size, d, softcap, mha_type, dtype, request):
+    if L >= 2048:
+        request.getfixturevalue("large_memory")
+    torch.random.manual_seed(L + d + block_size)
+    batch_size = 9 if L <= 2048 else 2
+    nheads, nheads_kv = _fa3_nheads(mha_type)
+    ns = torch.randint(max(1, L - 20), L + 1, (batch_size,)).tolist()
+    seqlens = [2 * x for x in ns]
+    cu_seqlens = torch.tensor([0] + list(torch.tensor(seqlens).cumsum(0)), device=DEVICE, dtype=torch.int32)
+    total = sum(seqlens)
+    q = _rand((total, nheads, d), dtype)
+    k = _rand((total, nheads_kv, d), dtype)
+    v = _rand((total, nheads_kv, d), dtype)
+    _check(q, k, v, block_size, softcap=softcap, cu_seqlens=cu_seqlens, max_seqlen=max(seqlens))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("heads_per_cta", [2, 64])
+@pytest.mark.parametrize("mha_type", ["mqa", "gqa"])
+@pytest.mark.parametrize("d", hdims(32, 64, 96, 128, 192, 256))
+@pytest.mark.parametrize("block_size", [1, 4, 64])
+@pytest.mark.parametrize("L, varlen", [(256, False), (1024, False), (256, True)])
+def test_gqa_grouped(L, varlen, block_size, d, mha_type, heads_per_cta, dtype, monkeypatch):
+    """The GQA-grouped backward (thread blocks summing the dK / dV of several query heads of a KV head,
+    bwd_heads_per_cta in flash_api.cpp), which the default choice uses only for some GPUs and shapes, forced on cases
+    of test_gqa_fa3 / test_gqa_fa3_varlen: 64, all the query heads of a KV head (final dK / dV); 2, partial sums of 2
+    query heads, summed afterwards (h / h_k = 6; with h / h_k = 3, the kernel is the ungrouped one)."""
+    monkeypatch.setenv("FDA_BWD_HEADS_PER_CTA", str(heads_per_cta))
+    torch.random.manual_seed(L + d + block_size)
+    batch_size = 9
+    nheads, nheads_kv = _fa3_nheads(mha_type)
+    if not varlen:
+        q = _rand((batch_size, 2 * L, nheads, d), dtype)
+        k = _rand((batch_size, 2 * L, nheads_kv, d), dtype)
+        v = _rand((batch_size, 2 * L, nheads_kv, d), dtype)
+        _check(q, k, v, block_size)
+        return
+    ns = torch.randint(max(1, L - 20), L + 1, (batch_size,)).tolist()
+    seqlens = [2 * x for x in ns]
+    cu_seqlens = torch.tensor([0] + list(torch.tensor(seqlens).cumsum(0)), device=DEVICE, dtype=torch.int32)
+    total = sum(seqlens)
+    q = _rand((total, nheads, d), dtype)
+    k = _rand((total, nheads_kv, d), dtype)
+    v = _rand((total, nheads_kv, d), dtype)
+    _check(q, k, v, block_size, cu_seqlens=cu_seqlens, max_seqlen=max(seqlens))
 
 
 @pytest.mark.parametrize("dtype", DTYPES)

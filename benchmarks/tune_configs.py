@@ -161,7 +161,7 @@ def main():
     D = args.headdim
     H = args.heads if args.heads is not None else args.hidden // D
     Hk = args.kv_heads if args.kv_heads is not None else H
-    num_candidates = 19 if args.direction == "fwd" else 25
+    num_candidates = 19 if args.direction == "fwd" else 34
     candidates = args.candidates if args.candidates is not None else list(range(num_candidates))
     p = args.dropout
     print(f"{torch.cuda.get_device_name()}: {args.direction}, headdim {D}, {args.dtype}, nheads {H}/{Hk}"

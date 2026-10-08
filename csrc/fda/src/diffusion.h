@@ -76,6 +76,29 @@ struct DiffusionBlockInfo {
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+// Order of the thread blocks. The grid is (num_tiles, b, h) as in FlashAttention-2, where the tiles of a (batch,
+// head) are enumerated in decreasing order of work. The thread blocks are scheduled in the order of the linear block
+// index: by groups of `sched_heads` (batch, head) pairs (heads fastest, so that the query heads of a KV head are in
+// the same group), and inside a group tile by tile, i.e. the most expensive tiles of the group first (longest
+// processing time first, which avoids a tail of expensive tiles at the end of the grid). Small groups keep the
+// working set of the concurrent thread blocks in L2.
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+__forceinline__ __device__ void tile_of_block(const int sched_heads, const int num_heads, int &tile, int &bidb, int &bidh) {
+    const int num_tiles = gridDim.x;
+    const int num_bh = gridDim.y * gridDim.z;
+    const int linear = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+    const int group_blocks = sched_heads * num_tiles;
+    const int group = linear / group_blocks;
+    const int r = linear - group * group_blocks;
+    const int group_bh = min(sched_heads, num_bh - group * sched_heads);
+    tile = r / group_bh;
+    const int bh = group * sched_heads + (r - tile * group_bh);
+    bidb = bh / num_heads;
+    bidh = bh - bidb * num_heads;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 // Visibility intervals.
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 

@@ -309,7 +309,7 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
         // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
         params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
         const char *env = std::getenv("FDA_FWD_NUM_SPLITS");
-        if (env != nullptr) { params.num_splits = std::max(1, std::atoi(env)); }
+        if (env != nullptr) { params.num_splits = std::max(1, parse_env_int(env)); }
         if (params.num_splits > 1) {
             softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen}, opts.dtype(at::kFloat));
             out_accum = torch::empty({params.num_splits, batch_size, num_heads, seqlen, head_size_rounded}, opts.dtype(at::kFloat));
@@ -574,6 +574,58 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 #endif
 }
 
+// Query heads per thread block of the backward kernel (a divisor of h / h_k): the thread block sums the dK / dV of
+// these query heads (compute_dq_dk_dv_1colblock), so that a KV tile is loaded once for them and their dK / dV are not
+// written per query head and summed afterwards (FlashAttention-2's dk_expanded, which is the case of 1). The largest
+// divisor k of h / h_k such that
+// - k <= a maximum per head dimension and kernel class (the configurations of run_mha_bwd_hdim*: those of >= 144 KB
+//   of shared memory per thread block, sm80, or of sm86 / sm89);
+// - the data the key tiles of the k heads share, Q and dO (16 bits) and the FP32 dQ accumulators of the 2n rows of a
+//   sample (16 n d bytes per head), is at most 0.3x the L2: beyond, the thread blocks of the key tiles no longer
+//   share the query tiles in L2 and grouping is slower, more so for larger k (the gain is largest for short
+//   sequences, where the dK / dV traffic per query head weighs the most);
+// - there are at least 2 waves of thread blocks.
+// Measured on FlashAttention-2's benchmark shapes with FlashAttention-3's head counts (nheads = 2048 / d, nheads_kv =
+// nheads / 4 or 1; tables in the commit message), against one query head per thread block: geometric mean over all the
+// shapes and lengths +3.2% on A800, +3.2% on L40S, +1.0% on RTX A6000 (its 6 MB of L2 rule out grouping except for
+// small head dimensions and short sequences); at 512 - 1K tokens per half +8.3%, +6.5%, +2.8%, up to +23%, +17%, +22%.
+// The maxima: sm80 4 (5 for head dimension 192, h / h_k = 5 there); sm86 / sm89 2, 4 for head dimensions 32 and 256,
+// 1 for 96 (grouping slower or neutral on L40S: 64 x 128 tiles with V in registers).
+// FDA_BWD_HEADS_PER_CTA overrides it (experiments): the largest divisor of h / h_k not larger than its value.
+int bwd_heads_per_cta(const int b, const int h, const int h_k, const int seqlen_half, const int head_size,
+                      const int num_sm, const int l2_size, const bool dropout_or_softcap, const bool deterministic) {
+    const int ratio = h / h_k;
+    // The grouped kernels are only instantiated without dropout and softcapping (flash_bwd_launch_template.h). The
+    // deterministic backward needs many thread blocks (get_deterministic_splits): grouping would divide their number
+    // by h / h_k, or multiply the dQ accumulation buffers (measured on A100: 10-25% slower).
+    if (dropout_or_softcap || deterministic) { return 1; }
+    const char *env = std::getenv("FDA_BWD_HEADS_PER_CTA");
+    if (env != nullptr) {
+        int gs = std::max(1, std::min(parse_env_int(env), ratio));
+        while (ratio % gs != 0) { --gs; }
+        return gs;
+    }
+    if (ratio == 1) { return 1; }
+    const bool sm80_configs = get_max_smem_per_block(get_current_device()) >= 144 * 1024;
+    int max_k, tile_n;  // tile_n: key tiles of the backward kernel (kBlockN)
+    switch (head_size) {
+        case 32: max_k = 4; tile_n = 128; break;
+        case 64: max_k = sm80_configs ? 4 : 2; tile_n = 128; break;
+        case 96: max_k = sm80_configs ? 4 : 1; tile_n = 128; break;
+        case 128: max_k = sm80_configs ? 4 : 2; tile_n = sm80_configs ? 128 : 64; break;
+        case 192: max_k = sm80_configs ? 5 : 2; tile_n = 64; break;
+        default: max_k = 4; tile_n = sm80_configs ? 64 : 32; break;  // 256
+    }
+    const int64_t num_key_tiles = 2 * int64_t((seqlen_half + tile_n - 1) / tile_n);
+    for (int k = std::min(max_k, ratio); k > 1; --k) {
+        if (ratio % k != 0) { continue; }
+        const int64_t working_set = int64_t(k) * 16 * seqlen_half * head_size;
+        const bool enough_ctas = num_key_tiles * b * (h / k) >= 2 * int64_t(num_sm);
+        if (10 * working_set <= 3 * int64_t(l2_size) && enough_ctas) { return k; }
+    }
+    return 1;
+}
+
 void set_params_bwd_dropout(Flash_bwd_params &params, std::optional<at::Tensor> &rng_state, const float p_dropout) {
     if ( rng_state.has_value() ) {
         params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
@@ -716,24 +768,31 @@ mha_bwd_impl(const at::Tensor &dout,  // batch_size x seqlen x num_heads x head_
     // dPsum and LSE in the padded layout (written by the pre-processing kernel)
     auto softmax_d = torch::empty({num_heads, total_padded}, opts.dtype(at::kFloat));
     auto softmax_lse_padded = torch::empty({num_heads, total_padded}, opts.dtype(at::kFloat));
+    const int num_sm = get_num_sm(get_current_device());
+    const int heads_per_cta = bwd_heads_per_cta(batch_size, num_heads, num_heads_k, seqlen / 2, head_size_rounded, num_sm,
+                                                get_l2_size(get_current_device()), p_dropout > 0.f || softcap > 0.f,
+                                                deterministic);
+    // Number of (partial) dK / dV heads written by the kernel
+    const int num_heads_partial = num_heads / heads_per_cta;
     at::Tensor dq_accum;
     if (!deterministic) {
         dq_accum = torch::empty({total_padded, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
     } else {
-        // FlashAttention-2: one wave of thread blocks, each accumulating into its own buffer (must match gridDimx in
-        // run_flash_bwd_seqk_parallel)
-        const int nsplits = (get_num_sm(get_current_device()) + batch_size * num_heads - 1) / (batch_size * num_heads);
+        // About 2 waves of thread blocks, each accumulating into its own buffer (must match gridDimx in
+        // run_flash_bwd_seqk_parallel; no GQA grouping in deterministic mode)
+        const int nsplits = get_deterministic_splits(num_sm, batch_size * num_heads, 2 * ((seqlen / 2 + 63) / 64));
         dq_accum = torch::zeros({nsplits, total_padded, num_heads, head_size_rounded}, opts.dtype(at::kFloat));
     }
 
-    // MQA / GQA: dK / dV per query head, summed over the query heads of a KV head afterwards (FlashAttention-2's
-    // dk_expanded / dv_expanded)
+    // MQA / GQA: the kernel sums dK / dV over heads_per_cta query heads. If heads_per_cta = h / h_k, it writes the
+    // final dK / dV; otherwise partial sums (of num_heads_partial heads) that are summed afterwards (as dk_expanded
+    // in FlashAttention-2, which corresponds to heads_per_cta = 1).
     at::Tensor dk_expanded, dv_expanded;
-    if (num_heads_k != num_heads) {
-        auto expanded_sizes = k.sizes().vec();
-        expanded_sizes[expanded_sizes.size() - 2] = num_heads;
-        dk_expanded = torch::empty(expanded_sizes, opts);
-        dv_expanded = torch::empty(expanded_sizes, opts);
+    if (num_heads_partial != num_heads_k) {
+        auto partial_sizes = k.sizes().vec();
+        partial_sizes[partial_sizes.size() - 2] = num_heads_partial;
+        dk_expanded = torch::empty(partial_sizes, opts);
+        dv_expanded = torch::empty(partial_sizes, opts);
     } else {
         dk_expanded = dk;
         dv_expanded = dv;
@@ -769,6 +828,7 @@ mha_bwd_impl(const at::Tensor &dout,  // batch_size x seqlen x num_heads x head_
                      /*unpadded_lse*/is_varlen);
     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
     params.total_q = total;
+    params.bwd_heads_per_cta = heads_per_cta;
 
     set_params_bwd_dropout(params, rng_state, p_dropout);
 
@@ -782,10 +842,10 @@ mha_bwd_impl(const at::Tensor &dout,  // batch_size x seqlen x num_heads x head_
         softmax_d.zero_();
     }
 
-    // For MQA/GQA we need to sum dK and dV across the groups
-    if (num_heads_k != num_heads) {
+    // For MQA/GQA we need to sum the partial dK and dV across the groups
+    if (num_heads_partial != num_heads_k) {
         auto grouped_sizes = k.sizes().vec();
-        grouped_sizes.insert(grouped_sizes.end() - 1, num_heads / num_heads_k);
+        grouped_sizes.insert(grouped_sizes.end() - 1, num_heads_partial / num_heads_k);
         const int64_t group_dim = grouped_sizes.size() - 2;
         at::sum_out(dk, at::reshape(dk_expanded, grouped_sizes), {group_dim});
         at::sum_out(dv, at::reshape(dv_expanded, grouped_sizes), {group_dim});
