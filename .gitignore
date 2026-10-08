@@ -1,0 +1,20 @@
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+
+# Benchmark outputs
+benchmark_results*.json
+
+# IDE
+.vscode/
+.idea/
+
+# Claude
+.claude/
+
+# Generated tuning candidates (FDA_TUNING=1 builds)
+csrc/fda/src/tuning/
