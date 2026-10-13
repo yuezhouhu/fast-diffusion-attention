@@ -18,7 +18,12 @@ python -m pytest tests/                                  # full build (python -m
 FDA_TEST_HDIMS=128 FDA_TEST_DISABLE_FP16=1 FDA_TEST_DISABLE_FP8=1 FDA_TEST_DISABLE_SOFTCAP=1 python -m pytest tests/  # dev build
 
 python benchmarks/benchmark_diffusion.py [--block-sizes 4 64] [--dtype fp8] [--varlen [--mixed]] [--no-bwd]
+python benchmarks/plot_figures.py   # figures of the README / docs (assets/*.png, light + dark) from docs/performance.md
 ```
+
+The measurements are in `docs/performance.md` (the README has the summary and the charts, `docs/blog.md` the
+blog post): after new measurements, update its tables and regenerate the figures (needs matplotlib; uses the Inter
+font if installed, `--font-dir`).
 
 The GPU of the development machine (H800 PCIe, 350 W cap) changes its clock with the power draw: compare variants
 in interleaved rounds (the benchmark does), never from separate runs. For kernel-level times use

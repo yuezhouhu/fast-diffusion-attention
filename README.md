@@ -1,51 +1,102 @@
+<div align="center">
+
 # Fast Diffusion Attention
 
-FlashAttention-3-class attention kernels for training block diffusion language models on NVIDIA Hopper GPUs.
+**FlashAttention-speed attention kernels for training block diffusion language models**
 
-Block diffusion training (BD3-LM, SDAR, RCD, ...) runs the model on the concatenation of a noisy copy and a clean copy
-of every sequence, with a block-structured attention mask. This library computes that attention with Hopper kernels
-derived from [FlashAttention-3](https://github.com/Dao-AILab/flash-attention/tree/main/hopper) (CUTLASS / CuTe, TMA,
-WGMMA, warp specialization, persistent scheduling): the mask is never materialized, only the visible part of the
-attention matrix is computed, and a training step runs at the throughput of FlashAttention-3 on the same amount of
-work (0.96-1.10x, see [Performance](#performance)).
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Hopper sm90](https://img.shields.io/badge/Hopper-sm90-76B900?logo=nvidia&logoColor=white)](#which-branch)
+[![Ampere / Ada sm80-sm89](https://img.shields.io/badge/Ampere%20%2F%20Ada-sm80%E2%80%93sm89-76B900?logo=nvidia&logoColor=white)](https://github.com/yuezhouhu/fast-diffusion-attention/tree/fa2)
+[![PyTorch >= 2.4](https://img.shields.io/badge/PyTorch-%E2%89%A5%202.4-EE4C2C?logo=pytorch&logoColor=white)](https://pytorch.org)
+[![CUDA >= 12.3](https://img.shields.io/badge/CUDA-%E2%89%A5%2012.3-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
 
-- Forward and backward in FP16 / BF16 (training), FP8 e4m3 forward (inference)
-- Batched interface (pretraining) and varlen interface (packed samples of different lengths, SFT)
-- Any block size, head dimensions up to 256, MQA / GQA, softcapping, deterministic backward, `torch.compile`
-- Interface modeled after FlashAttention-3 (`flash_attn_func` / `flash_attn_varlen_func`)
+[Performance](#performance) · [Installation](#installation) · [Quick start](#quick-start) · [Accuracy](#accuracy) ·
+[How it works](#how-it-works) · [Blog post](docs/blog.md)
 
-## The attention pattern
+</div>
 
-A sample of length `L = 2n` is laid out as `[noisy half (n tokens) | clean half (n tokens)]`. Each half is split into
-blocks of `block_size` tokens (prompt tokens are blocks like any other):
+<p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/pattern_dark.png">
+  <img alt="The block diffusion attention mask: noisy blocks see themselves and the previous clean blocks, clean blocks are block-causal" src="assets/pattern.png">
+</picture>
+</p>
 
-- a noisy block attends to itself and to all the previous clean blocks;
-- a clean block attends to itself and to all the previous clean blocks;
-- within a block, attention is fully bidirectional.
+Block diffusion language models ([BD3-LM](https://arxiv.org/abs/2503.09573), [SDAR](https://arxiv.org/abs/2510.06303),
+[RCD](https://arxiv.org/abs/2601.22954), ...) are trained on the concatenation of a noisy copy and a clean copy of every
+sequence, with the block-structured attention mask above. Fast Diffusion Attention computes this attention with kernels
+derived from FlashAttention: the mask is never materialized, only the visible tiles of the attention matrix are
+computed, and a training step runs at about the throughput of FlashAttention on the same amount of work.
 
-```
-                    keys:  noisy blocks       clean blocks
-                           x0  x1  x2  x3     c0  c1  c2  c3
-   queries  noisy  x0      ##  .   .   .      .   .   .   .
-                   x1      .   ##  .   .      ##  .   .   .
-                   x2      .   .   ##  .      ##  ##  .   .
-                   x3      .   .   .   ##     ##  ##  ##  .
-            clean  c0      .   .   .   .      ##  .   .   .
-                   c1      .   .   .   .      ##  ##  .   .
-                   c2      .   .   .   .      ##  ##  ##  .
-                   c3      .   .   .   .      ##  ##  ##  ##
-```
+- **FlashAttention speed.** A training step (forward + backward) runs at **0.96-1.10x** the throughput of
+  FlashAttention-3 doing the same work on H800, and at 0.94-1.30x FlashAttention-2 on A800, RTX A6000 and L40S
+  (geometric means per GPU and head dimension).
+- **Only the visible quarter.** About 25% of the `2n x 2n` attention matrix is visible. Invisible tiles are never
+  loaded or computed, and only the tiles that cross a block boundary are masked.
+- **Complete.** Forward and backward in BF16 / FP16, FP8 forward on Hopper, any block size, head dimensions up to 256,
+  MQA / GQA, varlen batches (packed samples), softcapping, dropout (Ampere / Ada), deterministic backward,
+  `torch.compile`.
+- **Tested like FlashAttention.** Errors within 2x those of PyTorch in the same precision, without bias, and matching
+  FlashAttention's own errors on the causal sub-problem.
+- **FlashAttention's interface.** `diffusion_attn_func` and `diffusion_attn_varlen_func` are modeled after
+  `flash_attn_func` and `flash_attn_varlen_func`, with `block_size` in place of `causal`.
 
-(each cell is a `block_size x block_size` sub-matrix, `##` visible, `.` masked; the last block of a half may be
-shorter). This is the BD3-LM block diffusion training mask, i.e. `block_diff_mask(..., use_regular_causal=False)` of
-SDAR-style models (`tests/test_diffusion_attn.py::test_mask_matches_idlm` checks the equivalence). A sample has about
-`n^2` visible (query, key) pairs: as many as causal attention on its two halves, half of causal attention on its `2n`
-tokens.
+## Performance
+
+### Hopper (H800)
+
+The yardstick is FlashAttention-3 doing the same work: *causal* attention on the two halves of every sample (a batch
+of `2B` sequences of length `n`), which has the same number of visible (query, key) pairs and the same tile structure
+as the diffusion mask ([why](docs/blog.md#the-right-yardstick)). TFLOPS count only the visible pairs. H800 PCIe
+(350 W), CUDA 13.0, PyTorch 2.12, FlashAttention-3 3.0.0.
+
+<p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/perf_h800_bf16_dark.png">
+  <img alt="Forward, backward and training-step TFLOPS on H800 with BF16 and head dimension 128, against FlashAttention-3" src="assets/perf_h800_bf16.png">
+</picture>
+</p>
+
+The backward pass, 75-80% of the attention time of a training step, runs at 0.95-1.18x the throughput of
+FlashAttention-3 and the forward pass at 0.87-1.06x. A training step runs at **0.96-1.10x** FlashAttention-3 with BF16
+and head dimension 128, and at 0.94-1.15x over all the configurations measured (varlen batches, head dimensions 64 and
+256, blocks of 256 and 1024 tokens); the FP8 forward runs at 0.89-0.97x.
+
+<p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/perf_h800_more_dark.png">
+  <img alt="TFLOPS on H800 for the FP8 forward, varlen batches and head dimensions 64 and 256, against FlashAttention-3" src="assets/perf_h800_more.png">
+</picture>
+</p>
+
+Every measurement, with the times: [docs/performance.md](docs/performance.md).
+
+### Ampere and Ada ([`fa2` branch](https://github.com/yuezhouhu/fast-diffusion-attention/tree/fa2))
+
+<p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/perf_ampere_ada_dark.png">
+  <img alt="Training-step throughput relative to FlashAttention-2 per head dimension on A800, RTX A6000 and L40S" src="assets/perf_ampere_ada.png">
+</picture>
+</p>
+
+Against FlashAttention-2 on its own benchmark shapes (MHA with hidden size 2048, L = 512 ... 16K tokens), a training
+step runs at 0.94-1.00x FlashAttention-2 on A800, 0.96-1.30x on RTX A6000 and 1.03-1.10x on L40S (geometric means per
+head dimension). Every measurement:
+[performance of the `fa2` branch](https://github.com/yuezhouhu/fast-diffusion-attention/blob/fa2/docs/performance.md).
+
+## Which branch?
+
+| | `main` (this branch) | [`fa2`](https://github.com/yuezhouhu/fast-diffusion-attention/tree/fa2) |
+|---|---|---|
+| GPUs | Hopper (sm90): H100, H800, H200, H20 | Ampere / Ada (sm80, sm86, sm89): A100, A800, A30, A10, A40, RTX A6000, L4, L40(S), RTX 30xx / 40xx |
+| Kernels derived from | [FlashAttention-3](https://github.com/Dao-AILab/flash-attention/tree/main/hopper) | [FlashAttention-2](https://github.com/Dao-AILab/flash-attention/tree/main/csrc/flash_attn) |
+| Training step vs FlashAttention | 0.96-1.10x FlashAttention-3 (H800) | 0.94-1.30x FlashAttention-2 (geometric means on A800, RTX A6000, L40S) |
+| Data types | BF16 / FP16, FP8 forward | BF16 / FP16 |
+| Dropout, packed QKV / KV functions | no | yes |
+| Requirements | CUDA >= 12.3, PyTorch >= 2.4, Linux | CUDA >= 12, PyTorch >= 2.4, Linux |
 
 ## Installation
-
-Requirements: Hopper GPU (sm90: H100 / H800 / H200 / H20), CUDA >= 12.3 (tested with 13.0), PyTorch >= 2.4 (tested
-with 2.12), Linux.
 
 ```bash
 git clone --recursive https://github.com/yuezhouhu/fast-diffusion-attention.git
@@ -53,8 +104,13 @@ cd fast-diffusion-attention
 pip install --no-build-isolation -v .
 ```
 
-The full build compiles 50 kernel files (about 7 minutes on 20 cores with `MAX_JOBS=16`). Environment variables to build only
-what you need:
+Requirements: a Hopper GPU (sm90), CUDA >= 12.3 (tested with 13.0), PyTorch >= 2.4 (tested with 2.12), Linux. For
+Ampere and Ada GPUs, clone the `fa2` branch instead (`git clone --recursive -b fa2 ...`).
+
+The full build compiles 50 kernel files (about 7 minutes on 20 cores with `MAX_JOBS=16`).
+
+<details>
+<summary>Build options: build only what you need</summary>
 
 | Variable | Effect |
 | --- | --- |
@@ -65,9 +121,12 @@ what you need:
 | `FDA_DISABLE_BACKWARD=1` | forward only |
 | `MAX_JOBS`, `NVCC_THREADS` | parallelism of the build |
 
-## Usage
+</details>
 
-### Batched (pretraining)
+## Quick start
+
+A sample of length `L = 2n` is laid out as `[noisy half (n tokens) | clean half (n tokens)]`, each half split into
+blocks of `block_size` tokens (prompt tokens are blocks like any other).
 
 ```python
 import torch
@@ -83,25 +142,23 @@ out = diffusion_attn_func(q, k, v, block_size=4)       # (B, 2n, H, D)
 out.backward(torch.randn_like(out))
 ```
 
-### Varlen (packed samples)
+**Varlen (packed samples, e.g. SFT).** Sample `i` occupies rows `[cu_seqlens[i], cu_seqlens[i + 1])` and is laid out
+as `[noisy (n_i) | clean (n_i)]`:
 
 ```python
 from fast_diffusion_attention import diffusion_attn_varlen_func
 
-# three samples with n = 300, 1000, 50: sample i occupies rows [cu_seqlens[i], cu_seqlens[i + 1])
-# and is laid out as [noisy (n_i) | clean (n_i)]
-ns = [300, 1000, 50]
+ns = [300, 1000, 50]                                    # three samples of 2 * n_i tokens
 cu_seqlens = torch.tensor([0, 600, 2600, 2700], device="cuda", dtype=torch.int32)
-total = 2 * sum(ns)
-q = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-k = torch.randn(total, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-v = torch.randn(total, H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+q = torch.randn(2 * sum(ns), H, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+k = torch.randn(2 * sum(ns), H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+v = torch.randn(2 * sum(ns), H_kv, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
 out = diffusion_attn_varlen_func(q, k, v, cu_seqlens, cu_seqlens, max_seqlen_q=2000, max_seqlen_k=2000,
-                                 block_size=4)    # (total, H, D)
+                                 block_size=4)          # (total, H, D)
 ```
 
-### FP8 forward (inference)
+**FP8 forward (inference).**
 
 ```python
 q8, k8, v8 = (x.detach().to(torch.float8_e4m3fn) for x in (q, k, v))
@@ -132,156 +189,92 @@ diffusion_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, ma
 | `return_attn_probs` | also return the log-sum-exp of the scores, `(batch, nheads, 2n)` or `(nheads, total)` |
 
 The output has the shape and dtype of `q` (BF16 for FP8 inputs). Both functions are differentiable (FP16 / BF16) and
-work with `torch.compile` (they are registered as custom ops with fake implementations).
+work with `torch.compile` (they are registered as custom ops with fake implementations). The mask is that of BD3-LM
+(`block_diff_mask(..., use_regular_causal=False)` of SDAR-style training code, checked by
+`tests/test_diffusion_attn.py::test_mask_matches_idlm`); `fast_diffusion_attention.reference` has a PyTorch reference
+implementation.
 
 ## Accuracy
 
-`tests/test_diffusion_attn.py` follows the methodology of the FlashAttention test suites: for the output, the
-log-sum-exp and dQ / dK / dV, the error of the kernel with respect to a float32 reference (computed from the same
-low-precision inputs) must be at most twice the error of a straightforward PyTorch implementation in the same
-low precision, plus a few ulps. It covers both dtypes, head dimensions 64-256 (including 80, 112, 160, 224), block
-sizes from 1 to larger than `n`, odd `n`, GQA / MQA, softcapping, varlen batches with very different and zero-length
-samples, non-contiguous inputs, custom softmax scales, deterministic mode and `torch.compile`.
+`tests/test_diffusion_attn.py` follows the methodology of the FlashAttention test suites:
 
-Beyond the max-error bound, `test_no_systematic_error` checks over many random problems that the errors have no
-systematic component: the relative bias and the relative scale error (least-squares slope of the kernel result against
-the reference, minus 1) of the output and of every gradient average to zero within 4 standard errors, and are on
-average no larger than twice those of PyTorch in the same precision. FP8 is tested as in FlashAttention-3: the error
-must be at most twice that of a BF16 PyTorch implementation that quantizes P to FP8 like the kernel, and the errors
-must be unbiased.
+- **Error bound.** For the output, the log-sum-exp and dQ / dK / dV, the error with respect to a float32 reference
+  (computed from the same low-precision inputs) is at most twice the error of a straightforward PyTorch implementation
+  in the same precision, plus a few ulps.
+- **No systematic error.** Over many random problems, the relative bias and scale error of the output and of every
+  gradient average to zero within 4 standard errors, and are no larger than twice those of PyTorch in the same
+  precision (`test_no_systematic_error`).
+- **The errors of FlashAttention-3.** With `block_size = 1` the clean half of a sample is causal attention: on this
+  sub-problem the errors of the output, the LSE and dQ / dK / dV match those of FlashAttention-3 (the forward results
+  are bitwise identical to FlashAttention-3's for most configurations; `test_accuracy_matches_fa3`).
+- **FP8** as in FlashAttention-3: the error is at most twice that of a BF16 implementation that quantizes P to FP8
+  like the kernel, without bias.
+- **Reproducibility.** The deterministic mode is bitwise reproducible, and the varlen kernels are bitwise identical to
+  the batched ones on equal-length samples.
 
-`test_accuracy_matches_fa3` compares directly with FlashAttention-3: with `block_size = 1` the clean half of a sample is
-causal attention on the clean tokens, and with a zero output gradient on the noisy half its gradients are those of that
-causal attention. On this subproblem the errors of the output, the LSE and dQ / dK / dV must match those of
-FlashAttention-3 (for all dtypes and head dimensions; in practice the forward results are bitwise identical to FA3's
-for most configurations). Deterministic mode is checked to be bitwise reproducible, and the varlen kernels to be
-bitwise identical to the batched ones on equal-length samples.
+The suite covers both dtypes, head dimensions 64-256 (including 80, 112, 160 and 224), block sizes from 1 to larger
+than `n`, odd `n`, MQA / GQA, softcapping, varlen batches with very different and zero-length samples, non-contiguous
+inputs, custom softmax scales, deterministic mode and `torch.compile`.
 
 ```bash
 pytest tests/                               # 1100 tests pass on the full build (+20 skipped)
 FDA_TEST_HDIMS=128 pytest tests/            # only the head dimensions that were built
 ```
 
-## Performance
-
-Measured with `benchmarks/benchmark_diffusion.py` on an H800 PCIe (114 SMs, 2.0 TB/s HBM, 350 W power cap) with
-CUDA 13.0, PyTorch 2.12 and FlashAttention-3 3.0.0 (flash-attention commit 3451a2a, `hopper/`). Batches of 16K tokens,
-32 query heads, 8 KV heads, head dimension 128 unless noted. Times cover the whole forward / backward call (including
-the pre- and post-processing kernels of the backward). TFLOPS count only the visible (query, key) pairs:
-`4 * pairs * headdim * nheads` for the forward, 2.5x that for the backward.
-
-The baseline is FlashAttention-3 *causal* attention on the two halves of every sample (a batch of `2B` sequences of
-length `n`). It has the same number of visible pairs and the same tile structure as the diffusion mask, so the ratio
-of the times is the ratio of the throughputs (causal attention on the `2n` tokens does twice the work). Variants are
-measured in interleaved rounds and the medians are reported: the power-capped GPU changes its clock with the load.
-
-**Summary.** Relative throughput = TFLOPS on the visible pairs relative to FlashAttention-3 (> 1: faster). The
-backward pass, 75-80% of the attention time of a training step, is on par with FlashAttention-3 (0.95-1.18x its
-throughput); the forward pass reaches 0.87-1.06x (0.89-0.98x for BF16 with head dimension 128). A whole training step
-(forward + backward, BF16, head dimension 128) runs at 0.96-1.10x the throughput of FlashAttention-3. The remaining
-forward gap comes from the noisy query tiles, which visit one more key tile than causal attention (their noisy
-diagonal tile, at half width when the block size divides 64): about 5% more work at L = 2K and 1% at 16K, plus a few
-percent of lower efficiency per iteration at long sequences.
-
-#### BF16, head dimension 128
-
-| | block size | forward ms (TFLOPS) | FA3 forward | rel. throughput | backward ms (TFLOPS) | FA3 backward | rel. throughput |
-|---|---|---|---|---|---|---|---|
-| L = 2K, B = 8 | 4 | 0.447 (309) | 0.400 (344) | **0.90** | 1.941 (178) | 1.976 (174) | **1.02** |
-|  | 16 | 0.457 (306) | 0.400 (344) | **0.89** | 1.937 (180) | 1.976 (174) | **1.03** |
-|  | 64 | 0.447 (327) | 0.400 (344) | **0.95** | 1.842 (198) | 1.976 (174) | **1.14** |
-| L = 4K, B = 4 | 4 | 0.742 (371) | 0.684 (402) | **0.92** | 2.814 (245) | 2.840 (242) | **1.01** |
-|  | 16 | 0.746 (371) | 0.684 (402) | **0.92** | 2.832 (245) | 2.840 (242) | **1.01** |
-|  | 64 | 0.749 (378) | 0.684 (402) | **0.94** | 2.754 (257) | 2.840 (242) | **1.06** |
-| L = 8K, B = 2 | 4 | 1.341 (410) | 1.270 (433) | **0.95** | 4.616 (298) | 4.515 (305) | **0.98** |
-|  | 16 | 1.340 (412) | 1.270 (433) | **0.95** | 4.604 (300) | 4.515 (305) | **0.98** |
-|  | 64 | 1.348 (414) | 1.270 (433) | **0.96** | 4.499 (310) | 4.515 (305) | **1.02** |
-| L = 16K, B = 1 | 4 | 2.673 (412) | 2.589 (425) | **0.97** | 8.180 (336) | 7.853 (350) | **0.96** |
-|  | 16 | 2.646 (416) | 2.589 (425) | **0.98** | 8.087 (341) | 7.853 (350) | **0.97** |
-|  | 64 | 2.699 (411) | 2.589 (425) | **0.97** | 8.042 (344) | 7.853 (350) | **0.98** |
-
-#### FP8 forward, head dimension 128
-
-| | block size | forward ms (TFLOPS) | FA3 forward | rel. throughput |
-|---|---|---|---|---|
-| L = 2K, B = 8 | 4 | 0.416 (332) | 0.368 (374) | **0.89** |
-|  | 64 | 0.411 (356) | 0.368 (374) | **0.95** |
-| L = 4K, B = 4 | 4 | 0.650 (424) | 0.602 (457) | **0.93** |
-|  | 64 | 0.653 (434) | 0.602 (457) | **0.95** |
-| L = 8K, B = 2 | 4 | 1.128 (488) | 1.036 (531) | **0.92** |
-|  | 64 | 1.141 (489) | 1.036 (531) | **0.92** |
-| L = 16K, B = 1 | 4 | 2.064 (533) | 1.929 (570) | **0.94** |
-|  | 64 | 2.011 (551) | 1.929 (570) | **0.97** |
-
-#### Varlen, samples of random lengths (BF16, head dimension 128)
-
-| | block size | forward ms (TFLOPS) | FA3 forward | rel. throughput | backward ms (TFLOPS) | FA3 backward | rel. throughput |
-|---|---|---|---|---|---|---|---|
-| lengths in [256, 2048] | 4 | 0.443 (216) | 0.421 (226) | **0.96** | 1.695 (141) | 1.779 (134) | **1.05** |
-|  | 64 | 0.442 (233) | 0.421 (226) | **1.03** | 1.631 (158) | 1.779 (134) | **1.18** |
-| lengths in [512, 4096] | 4 | 0.648 (311) | 0.632 (318) | **0.98** | 2.298 (219) | 2.256 (223) | **0.98** |
-|  | 64 | 0.646 (323) | 0.632 (318) | **1.02** | 2.247 (232) | 2.256 (223) | **1.04** |
-| lengths in [1024, 8192] | 4 | 0.520 (324) | 0.496 (339) | **0.96** | 1.780 (236) | 1.698 (248) | **0.95** |
-|  | 64 | 0.519 (333) | 0.496 (339) | **0.98** | 1.750 (247) | 1.698 (248) | **1.00** |
-| lengths in [2048, 16384] | 4 | 1.627 (397) | 1.582 (408) | **0.97** | 5.130 (315) | 4.889 (330) | **0.95** |
-|  | 64 | 1.667 (391) | 1.582 (408) | **0.96** | 5.105 (319) | 4.889 (330) | **0.97** |
-
-#### Head dimensions 64 and 256 (BF16)
-
-| | block size | forward ms (TFLOPS) | FA3 forward | rel. throughput | backward ms (TFLOPS) | FA3 backward | rel. throughput |
-|---|---|---|---|---|---|---|---|
-| d = 64, L = 2K, B = 8 | 4 | 0.337 (205) | 0.341 (201) | **1.02** | 1.116 (154) | 1.127 (153) | **1.01** |
-|  | 64 | 0.350 (208) | 0.341 (201) | **1.03** | 1.137 (161) | 1.127 (153) | **1.05** |
-| d = 64, L = 4K, B = 4 | 4 | 0.576 (239) | 0.502 (274) | **0.87** | 1.605 (214) | 1.539 (223) | **0.96** |
-|  | 64 | 0.594 (238) | 0.502 (274) | **0.87** | 1.640 (216) | 1.539 (223) | **0.97** |
-| d = 64, L = 8K, B = 2 | 4 | 1.020 (270) | 0.915 (301) | **0.90** | 2.592 (265) | 2.463 (279) | **0.95** |
-|  | 64 | 1.036 (269) | 0.915 (301) | **0.89** | 2.599 (269) | 2.463 (279) | **0.96** |
-| d = 64, L = 16K, B = 1 | 4 | 1.782 (309) | 1.693 (325) | **0.95** | 4.544 (303) | 4.379 (314) | **0.96** |
-|  | 64 | 1.785 (310) | 1.693 (325) | **0.95** | 4.537 (305) | 4.379 (314) | **0.97** |
-| d = 256, L = 4K, B = 4 | 4 | 1.390 (396) | 1.297 (424) | **0.93** | 6.759 (204) | 6.672 (206) | **0.99** |
-|  | 64 | 1.392 (407) | 1.297 (424) | **0.96** | 6.628 (214) | 6.672 (206) | **1.04** |
-| d = 256, L = 16K, B = 1 | 4 | 5.553 (396) | 5.832 (377) | **1.05** | 22.022 (250) | 21.643 (254) | **0.98** |
-|  | 64 | 5.555 (399) | 5.832 (377) | **1.06** | 21.445 (258) | 21.643 (254) | **1.02** |
-
-#### Large blocks (BF16, head dimension 128)
-
-| | block size | forward ms (TFLOPS) | FA3 forward | rel. throughput | backward ms (TFLOPS) | FA3 backward | rel. throughput |
-|---|---|---|---|---|---|---|---|
-| L = 4K, B = 4 | 256 | 0.759 (407) | 0.684 (402) | **1.01** | 3.038 (254) | 2.877 (239) | **1.06** |
-|  | 1024 | 0.989 (417) | 0.684 (402) | **1.04** | 3.688 (280) | 2.877 (239) | **1.17** |
-| L = 16K, B = 1 | 256 | 2.925 (388) | 2.802 (392) | **0.99** | 9.148 (310) | 8.670 (317) | **0.98** |
-|  | 1024 | 3.328 (372) | 2.802 (392) | **0.95** | 9.914 (312) | 8.670 (317) | **0.98** |
-
 ## How it works
 
-The kernels are those of FlashAttention-3 for Hopper with the causal mask replaced by the diffusion mask:
+The kernels are those of FlashAttention-3 with the causal mask replaced by the diffusion mask. All the mask geometry
+is in [`csrc/fda/diffusion.h`](csrc/fda/diffusion.h).
+
+<p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/tiles_dark.png">
+  <img alt="Tiles computed by the kernels: fully visible tiles without masking, partially visible tiles with masking, invisible tiles skipped" src="assets/tiles.png">
+</picture>
+</p>
 
 - **Tiles.** The two halves of a sample are tiled separately. A query tile of the clean half visits the clean key tiles
   up to its own (like causal attention); a query tile of the noisy half visits the clean key tiles before its blocks
   and the noisy key tiles of its blocks. Only the partially visible tiles (those crossing a block boundary, at most a
   few per query tile) are masked, with large blocks too. In the backward pass, a key tile visits the query tiles of
   both halves that see it.
-- **Forward.** Persistent warp-specialized kernel (1 producer warpgroup issuing TMA loads, 2 consumer warpgroups
-  running WGMMA with softmax overlapped with the GEMMs), longest-processing-time-first scheduling across batches,
+- **Forward.** Persistent warp-specialized kernel (a producer warpgroup issuing TMA loads, two consumer warpgroups
+  running WGMMA with the softmax overlapped with the GEMMs), longest-processing-time-first scheduling across batches,
   heads and halves. When the block size divides 64, the noisy diagonal tile of a 128-row query tile is computed at
   half width (each consumer warpgroup only needs the 64 keys of its own rows). For head dimension 64 (and FP8 with
-  head dimension 128) the tile size depends on the length of the halves: smaller tiles for short halves, where the
-  fixed cost of the noisy diagonal per query tile matters, the larger tiles of FA3 for long ones.
-- **Backward.** The main kernel follows FA3 (one CTA per key tile and head, dQ accumulated in FP32 with TMA reduce-add,
-  dK / dV of GQA heads summed in FP32). When the block size divides 64, the block-diagonal noisy-noisy part runs in a
-  separate kernel that processes all the query heads of a KV head per tile (pipelined with `cp.async`), writes the
-  initial value of dQ of the noisy queries and the complete dK / dV of the noisy keys; the main kernel then only
+  head dimension 128) the tile size depends on the length of the halves.
+- **Backward.** The main kernel follows FlashAttention-3 (one CTA per key tile and head, dQ accumulated in FP32 with
+  TMA reduce-add, dK / dV of GQA heads summed in FP32). When the block size divides 64, the block-diagonal noisy-noisy
+  part runs in a separate kernel that processes all the query heads of a KV head per tile, and the main kernel only
   iterates over the clean key tiles.
-- **Varlen.** Samples are scheduled longest first; per-sample offsets are aligned to tiles in the FP32 accumulators.
-- **Determinism.** As in FA3, the dQ (and GQA dK / dV) accumulations are ordered with semaphores.
+- **Varlen and determinism.** Samples are scheduled longest first, with per-sample offsets aligned to tiles in the
+  FP32 accumulators. As in FlashAttention-3, the deterministic mode orders the dQ (and GQA dK / dV) accumulations with
+  semaphores.
+
+The [blog post](docs/blog.md) tells the whole story.
 
 ## Limitations
 
-- Hopper (sm90a) only.
+- Hopper (sm90a) only on this branch; Ampere and Ada GPUs: [`fa2` branch](https://github.com/yuezhouhu/fast-diffusion-attention/tree/fa2).
 - Self-attention on `[noisy | clean]` samples with equal halves (`2n` tokens).
 - No FP8 backward and no deterministic backward for head dimension 256 (as FlashAttention-3), no dropout.
 
-## License
+## Citation
 
-MIT (see `LICENSE`). The CUDA kernels are derived from FlashAttention-3 (BSD 3-Clause) and use CUTLASS (BSD 3-Clause);
-see `NOTICE`.
+If you use Fast Diffusion Attention in your research, please cite it, and FlashAttention, from which the kernels are
+derived ([citations](https://github.com/Dao-AILab/flash-attention#citation)):
+
+```bibtex
+@software{hu2026fastdiffusionattention,
+  author = {Hu, Yuezhou},
+  title  = {Fast Diffusion Attention: FlashAttention-class kernels for block diffusion language models},
+  year   = {2026},
+  url    = {https://github.com/yuezhouhu/fast-diffusion-attention}
+}
+```
+
+## Acknowledgments and license
+
+The CUDA kernels are derived from [FlashAttention](https://github.com/Dao-AILab/flash-attention) (FlashAttention-3 on
+this branch, FlashAttention-2 on `fa2`) and built with [CUTLASS](https://github.com/NVIDIA/cutlass), both under the BSD
+3-Clause license (see [NOTICE](NOTICE)). Fast Diffusion Attention is released under the [MIT license](LICENSE).
