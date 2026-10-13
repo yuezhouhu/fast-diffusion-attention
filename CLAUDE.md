@@ -26,6 +26,7 @@ FDA_EMULATE_ARCH=86 python -m pytest tests/          # the kernels that sm86 / s
 # L = 512-16K) as B samples of 2L ([noisy L | clean L]) vs FlashAttention-2 causal on 2B x L
 python benchmarks/benchmark_diffusion.py [--headdim 128] [--block-sizes 4 64] [--heads 32 --kv-heads 8] [--dropout 0.1]
     [--varlen [--mixed]] [--deterministic] [--no-bwd] --min-ms 300
+python benchmarks/plot_figures.py   # figures of the README / docs (assets/*.png, light + dark) from docs/performance.md
 # Tuning (FlashAttention-2 workflow, automated): the candidates of csrc/fda/src/tuning.h (FlashAttention-2's search
 # space, every configuration of its launch templates: 19 forward, 25 backward; plus 9 backward configurations of ours)
 # vs the dispatch and FlashAttention-2, on its shapes, FP16. One generated file per candidate (csrc/fda/src/tuning/,
@@ -41,6 +42,10 @@ python benchmarks/select_configs.py a6000/fwd_hd64.txt
 # 3. Margins within 1.5% of the threshold: head to head with 9 rounds (the sweeps have ~2% of noise)
 python benchmarks/tune_configs.py --headdim 64 --direction fwd --min-ms 300 --candidates 5 6 --rounds 9
 ```
+
+The measurements are in `docs/performance.md`, the dispatch and tuning notes in `docs/tuning.md` (the README has the
+summary and the charts): after new measurements, update the tables and regenerate the figures (needs matplotlib; uses
+the Inter font if installed, `--font-dir`).
 
 Experiment knobs (environment, read at run time): `FDA_FWD_NUM_SPLITS` (number of splits of the split-KV forward,
 tests), `FDA_BWD_HEADS_PER_CTA` (GQA grouping of the backward: the largest divisor of h / h_k not above the value),
