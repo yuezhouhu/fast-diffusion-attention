@@ -17,12 +17,13 @@ out = diffusion_attn_func(q, k, v, block_size=4)   # q, k, v: (batch, 2n, heads,
 
 ## Block diffusion in one picture
 
-Block diffusion language models such as [BD3-LM](https://arxiv.org/abs/2503.09573),
-[SDAR](https://arxiv.org/abs/2510.06303) and [RCD](https://arxiv.org/abs/2601.22954) sit between autoregressive and
-diffusion models: they generate a sequence block by block, autoregressively, and denoise the tokens of each block in
-parallel, diffusion style. Training follows the same structure. BD3-LM computes the loss of all the blocks "in one
-forward pass on the concatenation x_noisy ⊕ x" of the noisy and the clean sequence, so that each noisy block can be
-denoised from the clean blocks before it. The attention mask that makes this work:
+Block diffusion language models such as [BD3-LM](https://github.com/kuleshov-group/bd3lms),
+[SDAR](https://github.com/JetAstra/SDAR), [RCD](https://github.com/yuezhouhu/residual-context-diffusion) and
+[ORL](https://github.com/Introspective-Diffusion/ORL) sit between autoregressive and diffusion models: they generate a
+sequence block by block, autoregressively, and denoise the tokens of each block in parallel, diffusion style. Training
+follows the same structure. BD3-LM computes the loss of all the blocks "in one forward pass on the concatenation
+x_noisy ⊕ x" of the noisy and the clean sequence ([paper](https://arxiv.org/abs/2503.09573)), so that each noisy block
+can be denoised from the clean blocks before it. The attention mask that makes this work:
 
 <p>
 <picture>
