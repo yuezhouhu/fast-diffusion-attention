@@ -22,8 +22,8 @@
 </picture>
 </p>
 
-Block diffusion language models ([BD3-LM](https://arxiv.org/abs/2503.09573), [SDAR](https://arxiv.org/abs/2510.06303),
-[RCD](https://arxiv.org/abs/2601.22954), ...) are trained on the concatenation of a noisy copy and a clean copy of every
+Block diffusion language models ([BD3-LM](https://github.com/kuleshov-group/bd3lms), [SDAR](https://github.com/JetAstra/SDAR),
+[RCD](https://github.com/yuezhouhu/residual-context-diffusion), [ORL](https://github.com/Introspective-Diffusion/ORL), ...) are trained on the concatenation of a noisy copy and a clean copy of every
 sequence, with the block-structured attention mask above. Fast Diffusion Attention computes this attention with kernels
 derived from FlashAttention: the mask is never materialized, only the visible tiles of the attention matrix are
 computed, and a training step runs at about the throughput of FlashAttention on the same amount of work.
