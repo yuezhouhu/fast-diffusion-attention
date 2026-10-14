@@ -4,6 +4,7 @@
 
 **FlashAttention-speed attention kernels for training block diffusion language models**
 
+[![Project page](https://img.shields.io/badge/Project-page-7c3aed)](https://yuezhouhu.github.io/projects/fast-diffusion-attention/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Hopper sm90](https://img.shields.io/badge/Hopper-sm90-76B900?logo=nvidia&logoColor=white)](#which-branch)
 [![Ampere / Ada sm80-sm89](https://img.shields.io/badge/Ampere%20%2F%20Ada-sm80%E2%80%93sm89-76B900?logo=nvidia&logoColor=white)](https://github.com/yuezhouhu/fast-diffusion-attention/tree/fa2)
@@ -11,7 +12,7 @@
 [![CUDA >= 12.3](https://img.shields.io/badge/CUDA-%E2%89%A5%2012.3-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
 
 [Performance](#performance) · [Installation](#installation) · [Quick start](#quick-start) · [Accuracy](#accuracy) ·
-[How it works](#how-it-works) · [Blog post](docs/blog.md)
+[How it works](#how-it-works) · [Project page](https://yuezhouhu.github.io/projects/fast-diffusion-attention/)
 
 </div>
 
@@ -47,8 +48,8 @@ computed, and a training step runs at about the throughput of FlashAttention on 
 
 The yardstick is FlashAttention-3 doing the same work: *causal* attention on the two halves of every sample (a batch
 of `2B` sequences of length `n`), which has the same number of visible (query, key) pairs and the same tile structure
-as the diffusion mask ([why](docs/blog.md#the-right-yardstick)). TFLOPS count only the visible pairs. H800 PCIe
-(350 W), CUDA 13.0, PyTorch 2.12, FlashAttention-3 3.0.0.
+as the diffusion mask ([why](https://yuezhouhu.github.io/projects/fast-diffusion-attention/#the-right-yardstick)). TFLOPS count
+only the visible pairs. H800 PCIe (350 W), CUDA 13.0, PyTorch 2.12, FlashAttention-3 3.0.0.
 
 <p>
 <picture>
@@ -251,7 +252,7 @@ is in [`csrc/fda/diffusion.h`](csrc/fda/diffusion.h).
   FP32 accumulators. As in FlashAttention-3, the deterministic mode orders the dQ (and GQA dK / dV) accumulations with
   semaphores.
 
-The [blog post](docs/blog.md) tells the whole story.
+The [project page](https://yuezhouhu.github.io/projects/fast-diffusion-attention/) tells the whole story.
 
 ## Limitations
 

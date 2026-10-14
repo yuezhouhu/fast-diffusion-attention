@@ -1,6 +1,6 @@
 # Fast Diffusion Attention: block diffusion training at FlashAttention speed
 
-*Yuezhou Hu, Kurt Keutzer, Chenfeng Xu · October 2026 ·
+*Yuezhou Hu, Kurt Keutzer, Chenfeng Xu · October 2026 · [Project page](https://yuezhouhu.github.io/projects/fast-diffusion-attention/) ·
 [Code](https://github.com/yuezhouhu/fast-diffusion-attention) · [Performance data](performance.md)*
 
 **TL;DR.** Block diffusion language models are trained on `[noisy | clean]` sequences with a block-structured attention

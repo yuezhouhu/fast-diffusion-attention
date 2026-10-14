@@ -1,6 +1,6 @@
 # Performance on Hopper
 
-[README](../README.md) · [Blog post](blog.md) · Ampere / Ada GPUs: [`fa2` branch](https://github.com/yuezhouhu/fast-diffusion-attention/blob/fa2/docs/performance.md)
+[README](../README.md) · [Project page](https://yuezhouhu.github.io/projects/fast-diffusion-attention/) · Ampere / Ada GPUs: [`fa2` branch](https://github.com/yuezhouhu/fast-diffusion-attention/blob/fa2/docs/performance.md)
 
 Every measurement of the Hopper kernels (`main` branch) against FlashAttention-3. The charts of the README are drawn
 from the tables of this page by `benchmarks/plot_figures.py`.
