@@ -334,7 +334,7 @@ derived ([citations](https://github.com/Dao-AILab/flash-attention#citation)):
 
 ```bibtex
 @software{hu2026fastdiffusionattention,
-  author = {Hu, Yuezhou},
+  author = {Hu, Yuezhou and Keutzer, Kurt and Xu, Chenfeng},
   title  = {Fast Diffusion Attention: FlashAttention-class kernels for block diffusion language models},
   year   = {2026},
   url    = {https://github.com/yuezhouhu/fast-diffusion-attention}
