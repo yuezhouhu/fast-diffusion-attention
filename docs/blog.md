@@ -1,7 +1,7 @@
 # Fast Diffusion Attention: block diffusion training at FlashAttention speed
 
-*Yuezhou Hu · October 2026 · [Code](https://github.com/yuezhouhu/fast-diffusion-attention) ·
-[Performance data](performance.md)*
+*Yuezhou Hu, Kurt Keutzer, Chenfeng Xu · October 2026 ·
+[Code](https://github.com/yuezhouhu/fast-diffusion-attention) · [Performance data](performance.md)*
 
 **TL;DR.** Block diffusion language models are trained on `[noisy | clean]` sequences with a block-structured attention
 mask. Fast Diffusion Attention builds that mask into the FlashAttention kernels themselves: FlashAttention-3 on Hopper,
