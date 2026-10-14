@@ -4,6 +4,7 @@
 
 **FlashAttention-speed attention kernels for training block diffusion language models**
 
+[![Project page](https://img.shields.io/badge/Project-page-7c3aed)](https://yuezhouhu.github.io/projects/fast-diffusion-attention/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Ampere / Ada sm80-sm89](https://img.shields.io/badge/Ampere%20%2F%20Ada-sm80%E2%80%93sm89-76B900?logo=nvidia&logoColor=white)](#which-branch)
 [![Hopper sm90](https://img.shields.io/badge/Hopper-main%20branch-76B900?logo=nvidia&logoColor=white)](https://github.com/yuezhouhu/fast-diffusion-attention)
@@ -11,7 +12,7 @@
 [![CUDA >= 12](https://img.shields.io/badge/CUDA-%E2%89%A5%2012-76B900?logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
 
 [Performance](#performance) · [Installation](#installation) · [Quick start](#quick-start) · [Accuracy](#accuracy) ·
-[How it works](#how-it-works) · [Blog post](https://github.com/yuezhouhu/fast-diffusion-attention/blob/main/docs/blog.md)
+[How it works](#how-it-works) · [Project page](https://yuezhouhu.github.io/projects/fast-diffusion-attention/)
 
 </div>
 
@@ -53,7 +54,7 @@ or faster.
 
 The yardstick is FlashAttention-2 doing the same work: *causal* attention on the two halves of every sample, which has
 the same number of visible (query, key) pairs and the same tile structure as the diffusion mask
-([why](https://github.com/yuezhouhu/fast-diffusion-attention/blob/main/docs/blog.md#the-right-yardstick)), on
+([why](https://yuezhouhu.github.io/projects/fast-diffusion-attention/#the-right-yardstick)), on
 FlashAttention-2's benchmark shapes (MHA with hidden size 2048, L = 512 ... 16K tokens). TFLOPS count only the visible
 pairs. CUDA 13.0, PyTorch 2.14, FlashAttention-2 2.8.4.
 
@@ -305,7 +306,7 @@ seqk-parallel backward) with the causal mask replaced by the diffusion mask. All
 - **Dispatch.** One tile configuration per head dimension, GPU class and dropout, in the format of FlashAttention-2's
   dispatch, tuned on an A800, an RTX A6000 and an L40S: see [dispatch and tuning](docs/tuning.md).
 
-The [blog post](https://github.com/yuezhouhu/fast-diffusion-attention/blob/main/docs/blog.md) tells the whole story.
+The [project page](https://yuezhouhu.github.io/projects/fast-diffusion-attention/) tells the whole story.
 
 ## Limitations
 

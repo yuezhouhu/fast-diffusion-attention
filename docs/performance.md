@@ -1,7 +1,7 @@
 # Performance on Ampere and Ada
 
 [README](../README.md) · [Dispatch and tuning](tuning.md) ·
-[Blog post](https://github.com/yuezhouhu/fast-diffusion-attention/blob/main/docs/blog.md) · Hopper GPUs:
+[Project page](https://yuezhouhu.github.io/projects/fast-diffusion-attention/) · Hopper GPUs:
 [`main` branch](https://github.com/yuezhouhu/fast-diffusion-attention/blob/main/docs/performance.md)
 
 Every measurement of the Ampere / Ada kernels (`fa2` branch) against FlashAttention-2, on an A800 (sm80), an RTX A6000
